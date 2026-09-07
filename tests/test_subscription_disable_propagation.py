@@ -252,7 +252,7 @@ async def test_add_time_keeps_disabled_when_enable_fails(
     await NewSubscriptionService(test_session).add_time_to_subscription(sub.id, 30)
 
     assert conn.is_enabled is False, "нельзя помечать включённым без подтверждения сервера"
-    assert conn.sync_status == "error"
+    assert conn.sync_status == "pending_push"
 
 
 @pytest.mark.asyncio

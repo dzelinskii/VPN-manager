@@ -188,7 +188,7 @@ async def test_partial_failure_is_reported(test_session, mock_settings, monkeypa
     result = await RenewalService(test_session).renew(sub.id, sub.expiry_date)
 
     assert result.failed_connections == 1
-    assert conn.sync_status == "error"
+    assert conn.sync_status == "pending_push"
     payments = (await test_session.execute(select(Payment))).scalars().all()
     assert len(payments) == 1
 
