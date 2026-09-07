@@ -1,6 +1,18 @@
-"""Экраны задания цены: шаблон и подписка."""
+"""Экраны задания цены: наличие кнопок и реальная маршрутизация callback'ов.
 
-from app.bot.keyboards.inline import get_template_edit_menu_keyboard
+Проверки роутинга сделаны через `Router.propagate_event`, а не поиском подстрок
+в исходнике: пересекающиеся префиксы callback_data ломаются молча, и тест по
+тексту остаётся зелёным при сломанном роутинге.
+"""
+
+import pytest
+from aiogram import Router
+from aiogram.dispatcher.event.bases import UNHANDLED
+
+from app.bot.keyboards.inline import (
+    get_subscription_details_keyboard,
+    get_template_edit_menu_keyboard,
+)
 from app.bot.states.admin import SubscriptionManagement, TemplateManagement
 
 
@@ -8,46 +20,72 @@ def _callbacks(markup):
     return [b.callback_data for row in markup.inline_keyboard for b in row]
 
 
+def _winning_handler(router: Router, data: str) -> str | None:
+    """Имя обработчика, который реально победит для данного callback_data.
+
+    Повторяет отбор aiogram: первый по порядку регистрации, чей фильтр прошёл.
+    """
+    for handler in router.callback_query.handlers:
+        stub = type("Stub", (), {"data": data})()
+        if all(_passes(f.callback, stub) for f in handler.filters or []):
+            return handler.callback.__name__
+    return None
+
+
+def _passes(check, stub) -> bool:
+    try:
+        result = check(stub)
+    except Exception:
+        return False
+    return bool(result) and result is not UNHANDLED
+
+
 def test_template_edit_menu_has_price():
     assert "template_edit_price_7" in _callbacks(get_template_edit_menu_keyboard(7))
 
 
-def test_template_price_state_exists():
-    assert TemplateManagement.editing_template_price is not None
-
-
-def test_subscription_price_state_exists():
-    assert SubscriptionManagement.editing_subscription_price is not None
-
-
 def test_subscription_details_has_price_button():
-    from app.bot.keyboards.inline import get_subscription_details_keyboard
-
     markup = get_subscription_details_keyboard(
         subscription_id=5, is_active=True, client_id=1, is_template=True
     )
     assert "admin_sub_price_5" in _callbacks(markup)
 
 
-def test_price_reset_is_not_shadowed_by_price_screen():
-    """`admin_sub_price_reset_N` начинается с `admin_sub_price_`.
+def test_price_states_exist():
+    assert TemplateManagement.editing_template_price is not None
+    assert SubscriptionManagement.editing_subscription_price is not None
 
-    Без исключающего фильтра экран цены перехватил бы кнопку сброса, потому что
-    зарегистрирован раньше.
-    """
-    import inspect
 
+@pytest.mark.parametrize(
+    ("callback_data", "expected"),
+    [
+        ("admin_sub_price_5", "start_edit_subscription_price"),
+        ("admin_sub_price_reset_5", "reset_subscription_price"),
+        ("admin_sub_price_cancel_5", "cancel_subscription_price"),
+    ],
+)
+def test_subscription_price_callbacks_reach_their_handlers(callback_data, expected):
+    """`reset_` и `cancel_` начинаются с `admin_sub_price_` и могли быть перехвачены."""
     from app.bot.handlers.admin import subscriptions
 
-    source = inspect.getsource(subscriptions)
-    assert '~F.data.startswith("admin_sub_price_reset_")' in source
+    assert _winning_handler(subscriptions.router, callback_data) == expected
 
 
-def test_template_edit_field_maps_price_to_state():
-    """Поле price должно быть в маршрутизации, иначе кнопка ведёт в «неизвестное поле»."""
-    import inspect
+@pytest.mark.parametrize(
+    ("callback_data", "expected"),
+    [
+        ("renew:do:5:1757251200", "renew_subscription"),
+        ("renew:do:confirmed:5:1757251200", "confirm_renew_without_price"),
+    ],
+)
+def test_renewal_callbacks_reach_their_handlers(callback_data, expected):
+    """`renew:do:confirmed:` вложен в `renew:do:` — без исключающего фильтра теряется."""
+    from app.bot.handlers.admin import renewals
 
+    assert _winning_handler(renewals.router, callback_data) == expected
+
+
+def test_template_price_field_routes_to_its_state():
     from app.bot.handlers.admin import templates
 
-    source = inspect.getsource(templates.start_edit_template)
-    assert '"price": TemplateManagement.editing_template_price' in source
+    assert _winning_handler(templates.router, "template_edit_price_7") == "start_edit_template"

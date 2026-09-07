@@ -32,6 +32,9 @@ def resolve_price(subscription: Subscription) -> int | None:
     return None
 
 
+MAX_PRICE_KOPECKS = 100_000_000  # 1 000 000 ₽ — заведомо выше любой разумной цены
+
+
 def parse_price_kopecks(text: str) -> int:
     """Разобрать введённую админом цену в рублях и вернуть копейки.
 
@@ -39,20 +42,29 @@ def parse_price_kopecks(text: str) -> int:
     бесплатная подписка.
 
     Raises:
-        ValueError: если ввод не число, отрицателен или дробит копейку.
+        ValueError: на любой некорректный ввод. Тип важен: вызывающие ловят
+            только его, а текст ошибки уходит в HTML-сообщение, поэтому сырой
+            ввод в него не подставляется.
     """
     cleaned = text.strip().replace(",", ".").replace(" ", "")
     try:
         rubles = Decimal(cleaned)
     except InvalidOperation as e:
-        raise ValueError(f"Не похоже на число: {text!r}") from e
+        raise ValueError("Не похоже на число") from e
 
+    # Decimal принимает inf и nan, а дальше они ломают и сравнение, и exponent.
+    if not rubles.is_finite():
+        raise ValueError("Не похоже на число")
     if rubles < 0:
         raise ValueError("Цена не может быть отрицательной")
     if -rubles.as_tuple().exponent > 2:
         raise ValueError("Копейка — минимальная единица, больше двух знаков после точки нельзя")
 
-    return int(rubles * 100)
+    kopecks = int(rubles * 100)
+    if kopecks > MAX_PRICE_KOPECKS:
+        raise ValueError(f"Слишком большая цена, максимум {MAX_PRICE_KOPECKS // 100} ₽")
+
+    return kopecks
 
 
 def format_price(amount: int | None) -> str:
