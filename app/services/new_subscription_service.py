@@ -813,9 +813,19 @@ class NewSubscriptionService:
 
         if inbound.type in ("awg_inbound", "mtproxy_inbound"):
             if enable:
-                await provider.enable_client(inbound, connection)
+                applied = await provider.enable_client(inbound, connection)
             else:
-                await provider.disable_client(inbound, connection)
+                applied = await provider.disable_client(inbound, connection)
+            if not applied:
+                # Флаг в БД не трогаем: иначе бот считает клиента отключённым,
+                # а на сервере он продолжает работать.
+                logger.warning(
+                    "Сервер не подтвердил смену статуса connection {} — статус не изменён",
+                    connection.id,
+                )
+                connection.sync_status = "error"
+                await self.session.flush()
+                return connection
         else:
             connection.is_enabled = enable
             await provider.update_client(
@@ -871,9 +881,16 @@ class NewSubscriptionService:
 
                 if inbound.type in ("awg_inbound", "mtproxy_inbound"):
                     if enable:
-                        await provider.enable_client(inbound, connection)
+                        applied = await provider.enable_client(inbound, connection)
                     else:
-                        await provider.disable_client(inbound, connection)
+                        applied = await provider.disable_client(inbound, connection)
+                    if not applied:
+                        logger.warning(
+                            "Сервер не подтвердил смену статуса connection {} — статус не изменён",
+                            connection.id,
+                        )
+                        connection.sync_status = "error"
+                        continue
                 else:
                     await provider.update_client(
                         inbound, connection, connection.total_gb, connection.expiry_date
@@ -1225,11 +1242,13 @@ class NewSubscriptionService:
 
         await self.session.flush()
 
-        # Update XUI clients if traffic/expiry parameters changed
+        # Смена статуса тоже требует похода на сервер: без этого подписка
+        # числится отключённой в БД, а VPN продолжает работать.
         if (
             total_gb is not None
             or expiry_days is not None
             or exact_expiry_date is not None
+            or is_active is not None
         ):
             result = await self.session.execute(
                 select(InboundConnection)
@@ -1253,13 +1272,31 @@ class NewSubscriptionService:
                 try:
                     provider = await self._get_provider(connection.inbound.server, inbound=connection.inbound)
 
-                    connection.is_enabled = subscription.is_active
-                    await provider.update_client(
-                        connection.inbound,
-                        connection,
-                        subscription.total_gb,
-                        subscription.expiry_date,
-                    )
+                    # У AWG/MTProxy update_client — заглушка, статусом управляют
+                    # отдельные enable_client/disable_client. У XUI флаг enable
+                    # едет внутри update_client.
+                    if connection.inbound.type in ("awg_inbound", "mtproxy_inbound"):
+                        if subscription.is_active:
+                            applied = await provider.enable_client(connection.inbound, connection)
+                        else:
+                            applied = await provider.disable_client(connection.inbound, connection)
+                        if not applied:
+                            logger.warning(
+                                "Сервер не подтвердил смену статуса connection {} — "
+                                "оставляю прежний статус",
+                                connection.id,
+                            )
+                            connection.sync_status = "error"
+                            continue
+                        connection.is_enabled = subscription.is_active
+                    else:
+                        connection.is_enabled = subscription.is_active
+                        await provider.update_client(
+                            connection.inbound,
+                            connection,
+                            subscription.total_gb,
+                            subscription.expiry_date,
+                        )
 
                     # Update per-connection settings
                     connection.total_gb = subscription.total_gb
@@ -1342,9 +1379,21 @@ class NewSubscriptionService:
                 connection.sync_status = "synced"
                 connection.last_sync_at = now
 
-                if connection.inbound.type in ("awg_inbound", "mtproxy_inbound") and not connection.is_enabled and subscription.is_active:
-                    await provider.enable_client(connection.inbound, connection)
-                    connection.is_enabled = True
+                if (
+                    connection.inbound.type in ("awg_inbound", "mtproxy_inbound")
+                    and not connection.is_enabled
+                    and subscription.is_active
+                ):
+                    if await provider.enable_client(connection.inbound, connection):
+                        connection.is_enabled = True
+                    else:
+                        # Продление без реального включения — худший случай для
+                        # оплаты: деньги приняты, доступа нет, и бот это скрывает.
+                        logger.warning(
+                            "Сервер не подтвердил включение connection {} после продления",
+                            connection.id,
+                        )
+                        connection.sync_status = "error"
             except Exception as e:
                 logger.warning(
                     "Не удалось обновить VPN-клиент для connection {}: {}",

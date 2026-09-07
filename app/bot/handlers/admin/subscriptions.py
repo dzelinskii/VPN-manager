@@ -1646,9 +1646,18 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
                     provider = providers[cache_key]
 
                     if new_state:
-                        await provider.enable_client(inbound, conn)
+                        applied = await provider.enable_client(inbound, conn)
                     else:
-                        await provider.disable_client(inbound, conn)
+                        applied = await provider.disable_client(inbound, conn)
+
+                    if not applied:
+                        # Не подтверждено сервером — статус не меняем, иначе бот
+                        # покажет «отключено», а подключение продолжит работать.
+                        logger.warning(
+                            "Сервер не подтвердил {} подключения {}", action, conn.id
+                        )
+                        conn.sync_status = "error"
+                        continue
 
                     conn.is_enabled = new_state
                     success_count += 1
