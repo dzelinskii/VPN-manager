@@ -1,5 +1,7 @@
 """Admin subscription management handlers."""
 
+import html
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -665,7 +667,9 @@ def _price_line(subscription) -> str:
 
 
 @router.callback_query(
-    F.data.startswith("admin_sub_price_") & ~F.data.startswith("admin_sub_price_reset_")
+    F.data.startswith("admin_sub_price_")
+    & ~F.data.startswith("admin_sub_price_reset_")
+    & ~F.data.startswith("admin_sub_price_cancel_")
 )
 async def start_edit_subscription_price(callback: CallbackQuery, state: FSMContext) -> None:
     """Спросить цену подписки."""
@@ -684,8 +688,12 @@ async def start_edit_subscription_price(callback: CallbackQuery, state: FSMConte
     await state.update_data(subscription_id=subscription_id)
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔄 Брать из шаблона", callback_data=f"admin_sub_price_reset_{subscription_id}")
-    builder.button(text="🔙 Отмена", callback_data=f"admin_sub_detail_{subscription_id}")
+    builder.button(
+        text="🔄 Брать из шаблона", callback_data=f"admin_sub_price_reset_{subscription_id}"
+    )
+    # Отмена ведёт через отдельный callback, а не сразу на карточку: иначе
+    # состояние ввода цены остаётся висеть и следующее же число её перезапишет.
+    builder.button(text="🔙 Отмена", callback_data=f"admin_sub_price_cancel_{subscription_id}")
     builder.adjust(1)
 
     await callback.message.edit_text(
@@ -696,6 +704,13 @@ async def start_edit_subscription_price(callback: CallbackQuery, state: FSMConte
         reply_markup=builder.as_markup(),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_sub_price_cancel_"))
+async def cancel_subscription_price(callback: CallbackQuery, state: FSMContext) -> None:
+    """Выйти из ввода цены, сбросив состояние."""
+    await state.clear()
+    await show_subscription_details(callback)
 
 
 @router.callback_query(F.data.startswith("admin_sub_price_reset_"))
@@ -720,7 +735,10 @@ async def process_subscription_price(message: TgMessage, state: FSMContext) -> N
     try:
         new_price = parse_price_kopecks(message.text or "")
     except ValueError as e:
-        await message.answer(f"⚠️ {e}\nВведите цену в рублях, например <code>349.90</code>:")
+        await message.answer(
+            f"⚠️ {html.escape(str(e))}\n"
+            "Введите цену в рублях, например <code>349.90</code>:"
+        )
         return
 
     data = await state.get_data()

@@ -123,8 +123,13 @@ class RenewalService:
             logger.info("Продление {} уже выполнено (ключ {})", subscription_id, key)
             raise AlreadyRenewedError(key) from e
 
+        # Провайдеры кэшируются внутри сервиса и держат aiohttp-сессии к панели,
+        # поэтому закрываем их — пульт самый кликаемый экран.
         service = NewSubscriptionService(self.session)
-        await service.add_time_to_subscription(subscription_id, RENEWAL_PERIOD_DAYS)
+        try:
+            await service.add_time_to_subscription(subscription_id, RENEWAL_PERIOD_DAYS)
+        finally:
+            await service.close_all_clients()
 
         failed = await self._count_failed_connections(subscription_id)
         if failed:

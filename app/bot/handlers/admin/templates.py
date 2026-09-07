@@ -1,6 +1,7 @@
 """Template management handlers for subscription templates."""
 
 import asyncio
+import html
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -1592,7 +1593,7 @@ async def process_edit_template_price(message: Message, state: FSMContext):
                 t(
                     "admin.templates.price_invalid",
                     "⚠️ {error}\nВведите цену в рублях, например <code>349.90</code>:",
-                    error=str(e),
+                    error=html.escape(str(e)),
                 )
             )
             return

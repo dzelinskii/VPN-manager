@@ -4,6 +4,7 @@ import html
 from datetime import UTC, datetime
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from loguru import logger
@@ -76,28 +77,28 @@ async def _show_list(callback: CallbackQuery, page: int) -> None:
         markup = _list_keyboard(page_items, page, len(due)).as_markup()
 
     if not due:
-        await callback.message.edit_text(
-            "✅ В ближайшие 7 дней продлевать некого.", reply_markup=markup
-        )
-        await callback.answer()
-        return
+        text = "✅ В ближайшие 7 дней продлевать некого."
+    else:
+        text = f"💰 <b>К продлению: {len(due)}</b>\n\n" + "\n\n".join(lines)
 
-    await callback.message.edit_text(
-        f"💰 <b>К продлению: {len(due)}</b>\n\n" + "\n\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=markup,
-    )
-    await callback.answer()
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except TelegramBadRequest as e:
+        # Два быстрых тапа перерисовывают список одинаковым текстом.
+        if "message is not modified" not in str(e).lower():
+            raise
 
 
 @router.callback_query(F.data == "admin_renewals")
 async def show_renewals(callback: CallbackQuery) -> None:
     await _show_list(callback, page=0)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("renew:page:"))
 async def show_renewals_page(callback: CallbackQuery) -> None:
     await _show_list(callback, page=int(callback.data.split(":")[2]))
+    await callback.answer()
 
 
 @router.callback_query(
