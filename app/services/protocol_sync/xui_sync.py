@@ -94,6 +94,9 @@ class XUIProtocolSync(ProtocolSyncBase):
         )
 
         synced_count = 0
+        # Провайдер для досылки создаём лениво и один на весь inbound: он держит
+        # aiohttp-сессию к панели, а подключений в очереди может быть много.
+        push_provider = None
         for xui_client_data in xui_clients:
             xui_uuid = xui_client_data.get("id", "")
             if not xui_uuid:
@@ -108,7 +111,13 @@ class XUIProtocolSync(ProtocolSyncBase):
                 # нужно наоборот дослать. Именно pending_push, а не error:
                 # error реконсиляция снимает сама, увидев клиента на панели.
                 if conn.sync_status == "pending_push":
-                    if await self._push_pending(inbound, conn):
+                    if push_provider is None:
+                        from app.services.vpn_providers.factory import get_vpn_provider
+
+                        push_provider = get_vpn_provider(
+                            inbound.server, inbound_type="xui_inbound"
+                        )
+                    if await self._push_pending(inbound, conn, push_provider):
                         synced_count += 1
                     continue
 
@@ -193,11 +202,14 @@ class XUIProtocolSync(ProtocolSyncBase):
                     conn.id, inbound.id,
                 )
 
+        if push_provider is not None:
+            await push_provider.close()
+
         await session.flush()
         logger.info("Синхронизировано {} клиентов для inbound {}", synced_count, inbound.id)
         return synced_count
 
-    async def _push_pending(self, inbound: "Inbound", conn) -> bool:
+    async def _push_pending(self, inbound: "Inbound", conn, provider) -> bool:
         """Дослать на панель локальное состояние подключения.
 
         Источник истины — подписка: на ней живут срок, лимит и признак
@@ -207,8 +219,6 @@ class XUIProtocolSync(ProtocolSyncBase):
         Признак ``pending_push`` снимается только после подтверждения панелью;
         иначе следующий цикл повторит попытку.
         """
-        from app.services.vpn_providers.factory import get_vpn_provider
-
         sub = conn.subscription
         if sub is None:
             logger.warning("Подключение {} без подписки — досылать нечего", conn.id)
@@ -222,7 +232,6 @@ class XUIProtocolSync(ProtocolSyncBase):
         previous_enabled = conn.is_enabled
         conn.is_enabled = desired_enabled
         try:
-            provider = get_vpn_provider(inbound.server, inbound_type="xui_inbound")
             applied = await provider.update_client(inbound, conn, sub.total_gb, sub.expiry_date)
         except Exception as e:
             conn.is_enabled = previous_enabled

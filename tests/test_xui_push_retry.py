@@ -224,6 +224,25 @@ async def test_expired_subscription_is_pushed_as_disabled(
 
 
 @pytest.mark.asyncio
+async def test_push_provider_is_closed(test_session, mock_settings, monkeypatch):
+    """Провайдер держит aiohttp-сессию к панели — цикл идёт каждые несколько минут."""
+    _, conn = await _setup(test_session, 998008)
+    provider = AsyncMock()
+    provider.update_client = AsyncMock(return_value=True)
+    provider.close = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.vpn_providers.factory.get_vpn_provider", lambda *a, **k: provider
+    )
+
+    inbound = await _load_inbound(test_session, conn.inbound_id)
+    await XUIProtocolSync().sync_clients(
+        test_session, inbound, xui_service=_panel(conn)
+    )
+
+    provider.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_missing_from_panel_is_logged(test_session, mock_settings, monkeypatch):
     """Дослать отсутствующего на панели нечем — такое не должно застревать молча.
 

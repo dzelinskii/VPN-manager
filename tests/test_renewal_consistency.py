@@ -160,7 +160,7 @@ async def test_renew_rejects_inactive_subscription(test_session, mock_settings, 
 
 
 @pytest.mark.asyncio
-async def test_xui_sync_does_not_revert_unpushed_expiry(test_session, mock_settings):
+async def test_xui_sync_does_not_revert_unpushed_expiry(test_session, mock_settings, monkeypatch):
     """Синхронизация не должна затирать локальный срок, если push на панель упал.
 
     Иначе продление молча теряется, а вместе с ним освобождается ключ
@@ -174,6 +174,14 @@ async def test_xui_sync_does_not_revert_unpushed_expiry(test_session, mock_setti
     conn.expiry_date = local_expiry
     conn.sync_status = "pending_push"  # push на панель не прошёл
     await test_session.flush()
+
+    # Досылка на панель не проходит — локальный срок обязан остаться.
+    push_provider = AsyncMock()
+    push_provider.update_client = AsyncMock(return_value=False)
+    push_provider.close = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.vpn_providers.factory.get_vpn_provider", lambda *a, **k: push_provider
+    )
 
     panel_expiry_ms = int((datetime.now(UTC) + timedelta(days=3)).timestamp() * 1000)
     panel_inbound = SimpleNamespace(

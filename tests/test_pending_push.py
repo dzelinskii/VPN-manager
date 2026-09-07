@@ -113,7 +113,7 @@ async def test_reconciler_does_not_heal_pending_push(test_session, mock_settings
 
 
 @pytest.mark.asyncio
-async def test_xui_sync_respects_pending_push(test_session, mock_settings):
+async def test_xui_sync_respects_pending_push(test_session, mock_settings, monkeypatch):
     """Синхронизация не принимает данные панели для непрошедшего изменения."""
     import json
     from types import SimpleNamespace
@@ -128,6 +128,15 @@ async def test_xui_sync_respects_pending_push(test_session, mock_settings):
     conn.expiry_date = local_expiry
     conn.sync_status = PENDING_PUSH
     await test_session.flush()
+
+    # Панель отказывает: досылка не проходит, значит защита обязана удержать
+    # локальный срок, а не откатить его к панельному.
+    push_provider = AsyncMock()
+    push_provider.update_client = AsyncMock(return_value=False)
+    push_provider.close = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.vpn_providers.factory.get_vpn_provider", lambda *a, **k: push_provider
+    )
 
     panel_ms = int((datetime.now(UTC) + timedelta(days=3)).timestamp() * 1000)
     xui_client = AsyncMock()
