@@ -23,6 +23,9 @@ class SubscriptionTemplate(Base, TimestampMixin):
         Integer, default=0, nullable=False
     )  # 0 = unlimited
     default_expiry_days: Mapped[int | None] = mapped_column(Integer, nullable=True)  # None = never
+    price_kopecks: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # цена за 30 дней; None = не задана
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_public: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

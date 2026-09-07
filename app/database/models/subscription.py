@@ -38,6 +38,9 @@ class Subscription(Base, TimestampMixin):
         unique=True,
     )
     total_gb: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # 0 = unlimited
+    price_kopecks: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # переопределяет цену шаблона; None = брать из шаблона, 0 = бесплатно
     expiry_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
