@@ -7,7 +7,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 from aiogram.types import Message as TgMessage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.bot.filters import AdminFilter
@@ -633,6 +633,24 @@ async def create_subscription(callback: CallbackQuery, state: FSMContext) -> Non
 
 
 # Additional subscription management handlers
+
+
+async def _count_pending_push(session, subscription_id: int) -> int:
+    """Сколько подключений подписки не доехало до сервера.
+
+    Нужно, чтобы не рапортовать «✅ отключено», когда на панели клиент жив.
+    """
+    from app.database.models import InboundConnection
+
+    result = await session.execute(
+        select(func.count())
+        .select_from(InboundConnection)
+        .where(
+            InboundConnection.subscription_id == subscription_id,
+            InboundConnection.sync_status == "pending_push",
+        )
+    )
+    return result.scalar() or 0
 
 
 def _price_line(subscription) -> str:
@@ -2397,10 +2415,18 @@ async def enable_subscription(callback: CallbackQuery) -> None:
         service = NewSubscriptionService(session)
         try:
             await service.update_subscription(subscription_id, is_active=True)
+            pending = await _count_pending_push(session, subscription_id)
             await session.commit()
         finally:
             await service.close_all_clients()
-    await callback.answer(t("admin.subscriptions.enabled_success", "✅ Подписка включена."))
+
+    if pending:
+        await callback.answer(
+            f"⚠️ Включено в базе, но {pending} подключений не применились на сервере",
+            show_alert=True,
+        )
+    else:
+        await callback.answer(t("admin.subscriptions.enabled_success", "✅ Подписка включена."))
     await show_subscription_details(callback)
 
 
@@ -2415,10 +2441,20 @@ async def disable_subscription(callback: CallbackQuery) -> None:
         service = NewSubscriptionService(session)
         try:
             await service.update_subscription(subscription_id, is_active=False)
+            pending = await _count_pending_push(session, subscription_id)
             await session.commit()
         finally:
             await service.close_all_clients()
-    await callback.answer(t("admin.subscriptions.disabled_success", "✅ Подписка отключена."))
+
+    if pending:
+        await callback.answer(
+            f"⚠️ Отключено в базе, но {pending} подключений остались живыми на сервере",
+            show_alert=True,
+        )
+    else:
+        await callback.answer(
+            t("admin.subscriptions.disabled_success", "✅ Подписка отключена.")
+        )
     await show_subscription_details(callback)
 
 

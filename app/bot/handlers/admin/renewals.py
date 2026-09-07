@@ -17,6 +17,7 @@ from app.services.pricing import format_price, resolve_price
 from app.services.renewal_service import (
     AlreadyRenewedError,
     RenewalService,
+    StaleRenewalError,
     SubscriptionNotFoundError,
 )
 
@@ -162,6 +163,13 @@ async def _do_renew(callback: CallbackQuery, sub_id: int, ts: int) -> None:
             return
         except SubscriptionNotFoundError:
             await callback.answer("Подписка не найдена", show_alert=True)
+            await _show_list(callback, page=0)
+            return
+        except StaleRenewalError:
+            await callback.answer(
+                "Данные подписки изменились — список обновлён, проверьте и повторите",
+                show_alert=True,
+            )
             await _show_list(callback, page=0)
             return
         except Exception as e:

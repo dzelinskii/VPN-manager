@@ -827,10 +827,17 @@ class NewSubscriptionService:
                 await self.session.flush()
                 return connection
         else:
+            previous_enabled = connection.is_enabled
             connection.is_enabled = enable
-            await provider.update_client(
-                inbound, connection, connection.total_gb, connection.expiry_date
-            )
+            try:
+                await provider.update_client(
+                    inbound, connection, connection.total_gb, connection.expiry_date
+                )
+            except Exception:
+                # Отказ жёсткий: иначе хэндлер отрапортует «включено» в ответ на
+                # неудавшуюся попытку отключить.
+                connection.is_enabled = previous_enabled
+                raise
 
         connection.is_enabled = enable
         await self.session.flush()
@@ -892,9 +899,20 @@ class NewSubscriptionService:
                         connection.sync_status = "error"
                         continue
                 else:
-                    await provider.update_client(
-                        inbound, connection, connection.total_gb, connection.expiry_date
-                    )
+                    # Новый флаг выставляем до вызова: XUI-провайдер читает его
+                    # из объекта. При отказе панели возвращаем прежний.
+                    previous_enabled = connection.is_enabled
+                    connection.is_enabled = enable
+                    try:
+                        await provider.update_client(
+                            inbound, connection, connection.total_gb, connection.expiry_date
+                        )
+                    except Exception:
+                        # Отказ жёсткий: вызывающий откатывает транзакцию целиком.
+                        # Проглатывать нельзя — получится наполовину отключённый
+                        # клиент с рапортом об успехе.
+                        connection.is_enabled = previous_enabled
+                        raise
 
                 connection.is_enabled = enable
                 toggled_count += 1
@@ -1290,13 +1308,21 @@ class NewSubscriptionService:
                             continue
                         connection.is_enabled = subscription.is_active
                     else:
+                        # XUI-провайдер берёт enable из объекта, поэтому новое
+                        # значение нужно выставить до вызова — и вернуть назад,
+                        # если панель его не приняла.
+                        previous_enabled = connection.is_enabled
                         connection.is_enabled = subscription.is_active
-                        await provider.update_client(
-                            connection.inbound,
-                            connection,
-                            subscription.total_gb,
-                            subscription.expiry_date,
-                        )
+                        try:
+                            await provider.update_client(
+                                connection.inbound,
+                                connection,
+                                subscription.total_gb,
+                                subscription.expiry_date,
+                            )
+                        except Exception:
+                            connection.is_enabled = previous_enabled
+                            raise
 
                     # Update per-connection settings
                     connection.total_gb = subscription.total_gb
@@ -1308,7 +1334,10 @@ class NewSubscriptionService:
                         "Не удалось обновить VPN-клиент для connection {}: {}",
                         connection.id, e,
                     )
-                    connection.sync_status = "error"
+                    # Намерение админа (is_active) остаётся в БД, но на сервер не
+                    # доехало: помечаем, чтобы синхронизация это не затёрла и
+                    # чтобы хэндлер мог сказать правду вместо «✅ отключено».
+                    connection.sync_status = "pending_push"
 
             await self.session.flush()
 
@@ -1393,13 +1422,16 @@ class NewSubscriptionService:
                             "Сервер не подтвердил включение connection {} после продления",
                             connection.id,
                         )
-                        connection.sync_status = "error"
+                        connection.sync_status = "pending_push"
             except Exception as e:
                 logger.warning(
                     "Не удалось обновить VPN-клиент для connection {}: {}",
                     connection.id, e,
                 )
-                connection.sync_status = "error"
+                # Новый срок уже в БД, но на сервере его нет — помечаем именно
+                # pending_push, иначе реконсиляция вылечит статус и следующий
+                # цикл откатит срок по данным панели.
+                connection.sync_status = "pending_push"
 
         await self.session.flush()
         updated = await self.get_subscription(subscription_id)

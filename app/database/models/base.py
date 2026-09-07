@@ -35,7 +35,11 @@ class SyncMixin:
         String(20),
         default="synced",
         nullable=False,
-    )  # "synced", "pending", "error", "offline"
+    )  # "synced", "error", "offline", "pending_push"
+    # "pending_push" — изменение записано в БД, но на сервер не доехало.
+    # Отдельное от "error" значение: реконсиляция выбирает именно error-записи и
+    # лечит те, чей клиент есть на панели, поэтому под тем статусом локальное
+    # изменение было бы затёрто данными сервера на следующем цикле.
     last_sync_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

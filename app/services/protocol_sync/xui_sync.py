@@ -66,7 +66,7 @@ class XUIProtocolSync(ProtocolSyncBase):
         if xui_clients:
             logger.debug("Пример данных клиента: {}", xui_clients[0])
 
-        from app.database.models import InboundConnection, Subscription
+        from app.database.models import Inbound, InboundConnection, Subscription
 
         conn_poly = with_polymorphic(InboundConnection, "*")
         state = sa_inspect(inbound)
@@ -102,6 +102,18 @@ class XUIProtocolSync(ProtocolSyncBase):
 
             if xui_uuid in existing_map:
                 conn = existing_map[xui_uuid]
+
+                # Локальное изменение ещё не доехало до панели: принять её данные
+                # значило бы молча потерять продление или смену статуса.
+                # Именно pending_push, а не error: error реконсиляция снимает
+                # сама, увидев клиента на панели, и защита жила бы один цикл.
+                if conn.sync_status == "pending_push":
+                    logger.warning(
+                        "Подключение {} ждёт отправки на сервер — не принимаем данные "
+                        "панели, чтобы не потерять непрошедшее изменение",
+                        conn.id,
+                    )
+                    continue
 
                 xui_enable = xui_client_data.get("enable", True)
                 xui_total_gb = xui_client_data.get("totalGB", 0) // (1024 * 1024 * 1024)
