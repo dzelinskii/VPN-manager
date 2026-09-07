@@ -103,16 +103,13 @@ class XUIProtocolSync(ProtocolSyncBase):
             if xui_uuid in existing_map:
                 conn = existing_map[xui_uuid]
 
-                # Локальное изменение ещё не доехало до панели: принять её данные
-                # значило бы молча потерять продление или смену статуса.
-                # Именно pending_push, а не error: error реконсиляция снимает
-                # сама, увидев клиента на панели, и защита жила бы один цикл.
+                # Локальное изменение ещё не доехало до панели: данные панели
+                # принимать нельзя (потеряем продление или смену статуса), их
+                # нужно наоборот дослать. Именно pending_push, а не error:
+                # error реконсиляция снимает сама, увидев клиента на панели.
                 if conn.sync_status == "pending_push":
-                    logger.warning(
-                        "Подключение {} ждёт отправки на сервер — не принимаем данные "
-                        "панели, чтобы не потерять непрошедшее изменение",
-                        conn.id,
-                    )
+                    if await self._push_pending(inbound, conn):
+                        synced_count += 1
                     continue
 
                 xui_enable = xui_client_data.get("enable", True)
@@ -180,9 +177,75 @@ class XUIProtocolSync(ProtocolSyncBase):
                     xui_uuid,
                 )
 
+        # Подключение, ждущее отправки, но отсутствующее на панели, дослать
+        # нечем: update_client правит существующего клиента. Реконсиляция его
+        # тоже не увидит — она выбирает по статусу "error". Логируем, чтобы
+        # такие записи не застревали молча.
+        panel_uuids = {c.get("id", "") for c in xui_clients}
+        for conn in existing_connections:
+            if (
+                conn.sync_status == "pending_push"
+                and getattr(conn, "uuid", None) not in panel_uuids
+            ):
+                logger.warning(
+                    "Подключение {} ждёт отправки, но отсутствует на панели inbound {} — "
+                    "досылка невозможна, требуется вмешательство",
+                    conn.id, inbound.id,
+                )
+
         await session.flush()
         logger.info("Синхронизировано {} клиентов для inbound {}", synced_count, inbound.id)
         return synced_count
+
+    async def _push_pending(self, inbound: "Inbound", conn) -> bool:
+        """Дослать на панель локальное состояние подключения.
+
+        Источник истины — подписка: на ней живут срок, лимит и признак
+        активности. У подключения ``is_enabled`` после неудачной попытки
+        отражает панель, а не намерение админа, поэтому опираться на него нельзя.
+
+        Признак ``pending_push`` снимается только после подтверждения панелью;
+        иначе следующий цикл повторит попытку.
+        """
+        from app.services.vpn_providers.factory import get_vpn_provider
+
+        sub = conn.subscription
+        if sub is None:
+            logger.warning("Подключение {} без подписки — досылать нечего", conn.id)
+            return False
+
+        expiry = sub.expiry_date
+        if expiry and expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        desired_enabled = bool(sub.is_active) and not (expiry and datetime.now(UTC) > expiry)
+
+        previous_enabled = conn.is_enabled
+        conn.is_enabled = desired_enabled
+        try:
+            provider = get_vpn_provider(inbound.server, inbound_type="xui_inbound")
+            applied = await provider.update_client(inbound, conn, sub.total_gb, sub.expiry_date)
+        except Exception as e:
+            conn.is_enabled = previous_enabled
+            logger.warning(
+                "Не удалось дослать подключение {} на панель: {} (повтор в следующем цикле)",
+                conn.id, e,
+            )
+            return False
+
+        if not applied:
+            conn.is_enabled = previous_enabled
+            logger.warning(
+                "Панель не подтвердила досылку подключения {} (повтор в следующем цикле)",
+                conn.id,
+            )
+            return False
+
+        conn.total_gb = sub.total_gb
+        conn.expiry_date = sub.expiry_date
+        conn.sync_status = "synced"
+        conn.last_sync_at = datetime.now(UTC)
+        logger.info("Подключение {} дослано на панель", conn.id)
+        return True
 
     async def verify_connection(
         self,
