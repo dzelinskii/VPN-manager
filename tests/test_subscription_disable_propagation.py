@@ -209,6 +209,53 @@ async def test_toggle_connection_applies_when_server_confirms(
 
 
 @pytest.mark.asyncio
+async def test_add_time_reenables_disabled_awg_connection(
+    test_session, mock_settings, monkeypatch
+):
+    """Продление должно возвращать доступ отключённому по сроку клиенту.
+
+    Это основной сценарий оплаты: деньги пришли — доступ включился.
+    """
+    sub, conn = await _setup(test_session, 991008, public_key="pk")
+    conn.is_enabled = False
+    await test_session.flush()
+
+    provider = _provider()
+    monkeypatch.setattr(
+        "app.services.new_subscription_service.get_vpn_provider", lambda *a, **k: provider
+    )
+
+    await NewSubscriptionService(test_session).add_time_to_subscription(sub.id, 30)
+
+    provider.enable_client.assert_awaited_once()
+    assert conn.is_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_add_time_keeps_disabled_when_enable_fails(
+    test_session, mock_settings, monkeypatch
+):
+    """Если сервер не включил клиента — нельзя считать подписку рабочей.
+
+    Иначе после оплаты бот покажет активный доступ, которого на сервере нет.
+    """
+    sub, conn = await _setup(test_session, 991009, public_key="pk")
+    conn.is_enabled = False
+    await test_session.flush()
+
+    provider = _provider()
+    provider.enable_client = AsyncMock(return_value=False)  # сервер не включил
+    monkeypatch.setattr(
+        "app.services.new_subscription_service.get_vpn_provider", lambda *a, **k: provider
+    )
+
+    await NewSubscriptionService(test_session).add_time_to_subscription(sub.id, 30)
+
+    assert conn.is_enabled is False, "нельзя помечать включённым без подтверждения сервера"
+    assert conn.sync_status == "error"
+
+
+@pytest.mark.asyncio
 async def test_name_only_update_does_not_touch_server(
     test_session, mock_settings, monkeypatch
 ):

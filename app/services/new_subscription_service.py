@@ -1379,9 +1379,21 @@ class NewSubscriptionService:
                 connection.sync_status = "synced"
                 connection.last_sync_at = now
 
-                if connection.inbound.type in ("awg_inbound", "mtproxy_inbound") and not connection.is_enabled and subscription.is_active:
-                    await provider.enable_client(connection.inbound, connection)
-                    connection.is_enabled = True
+                if (
+                    connection.inbound.type in ("awg_inbound", "mtproxy_inbound")
+                    and not connection.is_enabled
+                    and subscription.is_active
+                ):
+                    if await provider.enable_client(connection.inbound, connection):
+                        connection.is_enabled = True
+                    else:
+                        # Продление без реального включения — худший случай для
+                        # оплаты: деньги приняты, доступа нет, и бот это скрывает.
+                        logger.warning(
+                            "Сервер не подтвердил включение connection {} после продления",
+                            connection.id,
+                        )
+                        connection.sync_status = "error"
             except Exception as e:
                 logger.warning(
                     "Не удалось обновить VPN-клиент для connection {}: {}",
