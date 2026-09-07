@@ -109,6 +109,7 @@ class SubscriptionManagement(StatesGroup):
     editing_traffic = State()
     editing_expiry = State()
     editing_notes = State()
+    editing_subscription_price = State()
     waiting_for_add_days = State()
     waiting_for_mtproxy_domain = State()
 
@@ -149,6 +150,7 @@ class TemplateManagement(StatesGroup):
     editing_default_traffic = State()
     editing_default_expiry = State()
     editing_template_notes = State()
+    editing_template_price = State()
     editing_template_menu = State()  # For showing edit menu
 
     # Template inbound management states

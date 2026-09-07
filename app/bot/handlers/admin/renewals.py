@@ -7,10 +7,13 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from loguru import logger
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.bot.filters import AdminFilter
 from app.database import async_session_factory
-from app.services.pricing import resolve_price
+from app.database.models import Subscription
+from app.services.pricing import format_price, resolve_price
 from app.services.renewal_service import (
     AlreadyRenewedError,
     RenewalService,
@@ -23,15 +26,6 @@ router.callback_query.filter(AdminFilter())
 
 _PER_PAGE = 5
 _DUE_WINDOW_DAYS = 7
-
-
-def _format_amount(amount: int | None) -> str:
-    """Сумма для показа админу."""
-    if amount is None:
-        return "цена не задана"
-    if amount == 0:
-        return "бесплатно"
-    return f"{amount / 100:.2f} ₽"
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -76,7 +70,7 @@ async def _show_list(callback: CallbackQuery, page: int) -> None:
         for sub in page_items:
             lines.append(
                 f"👤 <b>{html.escape(sub.client.name)}</b> — {html.escape(sub.name)}\n"
-                f"   {_format_expiry(sub.expiry_date)}, {_format_amount(resolve_price(sub))}"
+                f"   {_format_expiry(sub.expiry_date)}, {format_price(resolve_price(sub))}"
             )
         markup = _list_keyboard(page_items, page, len(due)).as_markup()
 
@@ -105,10 +99,58 @@ async def show_renewals_page(callback: CallbackQuery) -> None:
     await _show_list(callback, page=int(callback.data.split(":")[2]))
 
 
-@router.callback_query(F.data.startswith("renew:do:"))
+@router.callback_query(
+    F.data.startswith("renew:do:") & ~F.data.startswith("renew:do:confirmed:")
+)
 async def renew_subscription(callback: CallbackQuery) -> None:
+    """Продлить подписку, спросив подтверждение при незаданной цене."""
     _, _, sub_id, ts = callback.data.split(":")
-    expected_expiry = datetime.fromtimestamp(int(ts), tz=UTC)
+
+    async with async_session_factory() as session:
+        subscription = (
+            await session.execute(
+                select(Subscription)
+                .where(Subscription.id == int(sub_id))
+                .options(selectinload(Subscription.template))
+            )
+        ).scalar_one_or_none()
+        if subscription is None:
+            await callback.answer("Подписка не найдена", show_alert=True)
+            await _show_list(callback, page=0)
+            return
+        price = resolve_price(subscription)
+        name = subscription.name
+
+    if price is None:
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text="✅ Продлить без оплаты",
+            callback_data=f"renew:do:confirmed:{sub_id}:{ts}",
+        )
+        builder.button(text="🔙 Отмена", callback_data="admin_renewals")
+        builder.adjust(1)
+        await callback.message.edit_text(
+            f"⚠️ У подписки <b>{html.escape(name)}</b> не задана цена.\n\n"
+            "Продление запишется как бесплатное. Если клиент платит — сначала "
+            "задайте цену в подписке или в шаблоне.",
+            parse_mode="HTML",
+            reply_markup=builder.as_markup(),
+        )
+        await callback.answer()
+        return
+
+    await _do_renew(callback, int(sub_id), int(ts))
+
+
+@router.callback_query(F.data.startswith("renew:do:confirmed:"))
+async def confirm_renew_without_price(callback: CallbackQuery) -> None:
+    """Продлить подписку без заданной цены после явного подтверждения."""
+    _, _, _, sub_id, ts = callback.data.split(":")
+    await _do_renew(callback, int(sub_id), int(ts))
+
+
+async def _do_renew(callback: CallbackQuery, sub_id: int, ts: int) -> None:
+    expected_expiry = datetime.fromtimestamp(ts, tz=UTC)
 
     async with async_session_factory() as session:
         try:
@@ -127,7 +169,7 @@ async def renew_subscription(callback: CallbackQuery) -> None:
             await callback.answer("❌ Ошибка продления, см. логи", show_alert=True)
             return
 
-    text = f"✅ Продлено на 30 дн., {_format_amount(result.amount_kopecks)}"
+    text = f"✅ Продлено на 30 дн., {format_price(result.amount_kopecks)}"
     if result.failed_connections:
         text += f"\n⚠️ Не применилось подключений: {result.failed_connections}"
     await callback.answer(text, show_alert=bool(result.failed_connections))

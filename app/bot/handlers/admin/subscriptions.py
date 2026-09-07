@@ -21,6 +21,12 @@ from app.bot.states.admin import SubscriptionManagement, SubscriptionRebuild
 from app.database import async_session_factory
 from app.database.models import Inbound
 from app.services.client_service import ClientService
+from app.services.pricing import (
+    format_price,
+    parse_price_kopecks,
+    resolve_price,
+    set_subscription_price,
+)
 from app.services.xui_service import XUIService
 from app.utils.texts import t
 
@@ -629,6 +635,93 @@ async def create_subscription(callback: CallbackQuery, state: FSMContext) -> Non
 # Additional subscription management handlers
 
 
+def _price_line(subscription) -> str:
+    """Цена подписки с пометкой, откуда она взялась."""
+    if subscription.price_kopecks is not None:
+        return f"{format_price(subscription.price_kopecks)} (своя)"
+
+    resolved = resolve_price(subscription)
+    if resolved is None:
+        return format_price(None)
+    return f"{format_price(resolved)} (из шаблона)"
+
+
+@router.callback_query(
+    F.data.startswith("admin_sub_price_") & ~F.data.startswith("admin_sub_price_reset_")
+)
+async def start_edit_subscription_price(callback: CallbackQuery, state: FSMContext) -> None:
+    """Спросить цену подписки."""
+    subscription_id = int(callback.data.split("_")[-1])
+
+    async with async_session_factory() as session:
+        from app.services.new_subscription_service import NewSubscriptionService
+
+        subscription = await NewSubscriptionService(session).get_subscription(subscription_id)
+        if not subscription:
+            await callback.answer("Подписка не найдена", show_alert=True)
+            return
+        current = _price_line(subscription)
+
+    await state.set_state(SubscriptionManagement.editing_subscription_price)
+    await state.update_data(subscription_id=subscription_id)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Брать из шаблона", callback_data=f"admin_sub_price_reset_{subscription_id}")
+    builder.button(text="🔙 Отмена", callback_data=f"admin_sub_detail_{subscription_id}")
+    builder.adjust(1)
+
+    await callback.message.edit_text(
+        f"💰 <b>Цена подписки</b>\n\nСейчас: {current}\n\n"
+        "Введите цену за 30 дней в рублях, например <code>349.90</code>.\n"
+        "0 = бесплатно.",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_sub_price_reset_"))
+async def reset_subscription_price(callback: CallbackQuery, state: FSMContext) -> None:
+    """Убрать переопределение — цена снова берётся из шаблона."""
+    subscription_id = int(callback.data.split("_")[-1])
+
+    async with async_session_factory() as session:
+        if not await set_subscription_price(session, subscription_id, None):
+            await callback.answer("Подписка не найдена", show_alert=True)
+            return
+        await session.commit()
+
+    await state.clear()
+    await callback.answer("Цена берётся из шаблона")
+    await show_subscription_details(callback)
+
+
+@router.message(SubscriptionManagement.editing_subscription_price)
+async def process_subscription_price(message: TgMessage, state: FSMContext) -> None:
+    """Сохранить введённую цену подписки."""
+    try:
+        new_price = parse_price_kopecks(message.text or "")
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}\nВведите цену в рублях, например <code>349.90</code>:")
+        return
+
+    data = await state.get_data()
+    subscription_id = data.get("subscription_id")
+    await state.clear()
+    if not subscription_id:
+        await message.answer("❌ Контекст устарел, откройте подписку заново.")
+        return
+
+    async with async_session_factory() as session:
+        if not await set_subscription_price(session, int(subscription_id), new_price):
+            await message.answer("⚠️ Подписка не найдена")
+            return
+        await session.commit()
+
+    logger.info("Цена подписки {} обновлена: {}", subscription_id, format_price(new_price))
+    await message.answer(f"✅ Цена: {format_price(new_price)}")
+
+
 @router.callback_query(F.data.startswith("admin_sub_detail_"))
 @router.callback_query(F.data.startswith("client_sub_detail_"))
 async def show_subscription_details(callback: CallbackQuery) -> None:
@@ -699,6 +792,7 @@ async def show_subscription_details(callback: CallbackQuery) -> None:
         "📊 Статус: {status}\n"
         "📦 Трафик: {traffic}\n"
         "⏰ Срок: {expiry}\n"
+        "💰 Цена: {price}\n"
         "📅 Создана: {created_at}\n"
         "🔌 Подключений: {conn_count}\n\n",
         name=subscription.name,
@@ -711,6 +805,7 @@ async def show_subscription_details(callback: CallbackQuery) -> None:
         status=status,
         traffic=traffic,
         expiry=expiry,
+        price=_price_line(subscription),
         created_at=subscription.created_at.strftime("%d.%m.%Y %H:%M"),
         conn_count=len(subscription.inbound_connections),
     )

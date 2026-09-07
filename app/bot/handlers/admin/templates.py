@@ -25,6 +25,7 @@ from app.bot.keyboards import (
 from app.bot.states.admin import TemplateManagement
 from app.database import async_session_factory
 from app.services.client_service import ClientService
+from app.services.pricing import format_price, parse_price_kopecks, set_template_price
 from app.services.subscription_template_service import SubscriptionTemplateService
 from app.utils.texts import t
 from app.xui_client.exceptions import XUIError
@@ -360,11 +361,13 @@ async def show_template_details(callback: CallbackQuery):
             "📝 {description}\n"
             "📊 <b>Лимит трафика:</b> {traffic}\n"
             "📅 <b>Срок действия:</b> {expiry}\n"
+            "💰 <b>Цена:</b> {price}\n"
             "🔌 <b>Подключений:</b> {count}\n",
             name=template.name,
             description=template.description or t("admin.templates.no_description", "Нет описания"),
             traffic=traffic_limit,
             expiry=expiry_text,
+            price=format_price(template.price_kopecks),
             count=inbounds_count,
         )
 
@@ -1085,6 +1088,7 @@ async def start_edit_template(callback: CallbackQuery, state: FSMContext):
         "traffic": TemplateManagement.editing_default_traffic,
         "expiry": TemplateManagement.editing_default_expiry,
         "notes": TemplateManagement.editing_template_notes,
+        "price": TemplateManagement.editing_template_price,
     }
 
     if edit_field not in state_mapping:
@@ -1148,6 +1152,11 @@ async def start_edit_template(callback: CallbackQuery, state: FSMContext):
             "Текущие заметки: <b>{notes}</b>",
             notes=template.notes or t("admin.templates.no_notes", "Нет заметок"),
         ),
+        "price": t(
+            "admin.templates.current_price",
+            "Текущая цена: <b>{price}</b>",
+            price=format_price(template.price_kopecks),
+        ),
     }
 
     prompt_messages = {
@@ -1170,6 +1179,11 @@ async def start_edit_template(callback: CallbackQuery, state: FSMContext):
         "notes": t(
             "admin.templates.prompt_new_notes",
             "Введите новые заметки (или /skip чтобы оставить текущие):",
+        ),
+        "price": t(
+            "admin.templates.prompt_new_price",
+            "Введите цену за 30 дней в рублях, например <code>349.90</code>.\n"
+            "0 = бесплатно, /clear = убрать цену, /skip = оставить текущую:",
         ),
     }
 
@@ -1553,6 +1567,58 @@ async def process_edit_template_notes(message: Message, state: FSMContext):
             t("admin.templates.update_notes_error", "❌ Произошла ошибка при изменении заметок")
         )
         await show_template_details_edit_menu(message, state)
+
+
+@router.message(TemplateManagement.editing_template_price)
+async def process_edit_template_price(message: Message, state: FSMContext):
+    """Обработать ввод цены шаблона.
+
+    ``/clear`` убирает цену (её унаследуют подписки как «не задана»),
+    ``/skip`` оставляет текущую.
+    """
+    raw = (message.text or "").strip()
+
+    if raw == "/skip":
+        await show_template_details_edit_menu(message, state)
+        return
+
+    if raw == "/clear":
+        new_price = None
+    else:
+        try:
+            new_price = parse_price_kopecks(raw)
+        except ValueError as e:
+            await message.answer(
+                t(
+                    "admin.templates.price_invalid",
+                    "⚠️ {error}\nВведите цену в рублях, например <code>349.90</code>:",
+                    error=str(e),
+                )
+            )
+            return
+
+    data = await state.get_data()
+    template_id = data["template_id"]
+
+    try:
+        async with async_session_factory() as session:
+            if not await set_template_price(session, template_id, new_price):
+                await message.answer(t("admin.templates.not_found", "⚠️ Шаблон не найден"))
+                await show_template_details_edit_menu(message, state)
+                return
+            await session.commit()
+
+        logger.info("Цена шаблона {} обновлена: {}", template_id, format_price(new_price))
+        await message.answer(
+            t("admin.templates.price_updated", "✅ Цена: {price}", price=format_price(new_price))
+        )
+    except Exception as e:
+        logger.error("Ошибка обновления цены шаблона: {}", e, exc_info=True)
+        await message.answer(
+            t("admin.templates.update_price_error", "❌ Не удалось изменить цену")
+        )
+
+    await show_template_details_edit_menu(message, state)
 
 
 async def show_template_details_edit_menu(message: Message, state: FSMContext):
