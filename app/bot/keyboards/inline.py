@@ -101,6 +101,10 @@ def get_admin_clients_menu_keyboard() -> InlineKeyboardMarkup:
         text=t("keyboards.main_menu.admin.broadcast", "📢 Уведомление всем"),
         callback_data="admin_broadcast",
     )
+    builder.button(
+        text=t("keyboards.main_menu.admin.renewals", "💰 Продления"),
+        callback_data="admin_renewals",
+    )
     builder.button(text=t("keyboards.common.back", "🔙 Назад"), callback_data="admin_menu")
     builder.adjust(1)
     return builder.as_markup()
