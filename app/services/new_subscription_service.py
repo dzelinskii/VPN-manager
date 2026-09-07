@@ -1308,21 +1308,18 @@ class NewSubscriptionService:
                             continue
                         connection.is_enabled = subscription.is_active
                     else:
-                        # XUI-провайдер берёт enable из объекта, поэтому новое
-                        # значение нужно выставить до вызова — и вернуть назад,
-                        # если панель его не приняла.
-                        previous_enabled = connection.is_enabled
+                        # Флаг остаётся намерением админа даже при отказе панели:
+                        # строка в статусе pending_push хранит желаемое
+                        # состояние, а досылка отправит её как есть. Откатывать
+                        # нельзя — иначе намерение потеряется и досылать будет
+                        # нечего.
                         connection.is_enabled = subscription.is_active
-                        try:
-                            await provider.update_client(
-                                connection.inbound,
-                                connection,
-                                subscription.total_gb,
-                                subscription.expiry_date,
-                            )
-                        except Exception:
-                            connection.is_enabled = previous_enabled
-                            raise
+                        await provider.update_client(
+                            connection.inbound,
+                            connection,
+                            subscription.total_gb,
+                            subscription.expiry_date,
+                        )
 
                     # Update per-connection settings
                     connection.total_gb = subscription.total_gb

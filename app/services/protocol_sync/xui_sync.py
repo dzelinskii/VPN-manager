@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload, with_polymorphic
 
 from app.services.protocol_sync import ProtocolSyncBase, register
+from app.utils.date_utils import ensure_utc
 from app.xui_client.models import ensure_settings_dict
 
 if TYPE_CHECKING:
@@ -117,6 +118,11 @@ class XUIProtocolSync(ProtocolSyncBase):
                         push_provider = get_vpn_provider(
                             inbound.server, inbound_type="xui_inbound"
                         )
+                        # Переиспользуем уже аутентифицированного клиента: иначе
+                        # провайдер логинится в панель заново на каждый inbound.
+                        # Клиент принадлежит XUIService — закрывать его здесь
+                        # нельзя, он живёт в кэше сервиса.
+                        push_provider._client = xui_client
                     if await self._push_pending(inbound, conn, push_provider):
                         synced_count += 1
                     continue
@@ -190,51 +196,77 @@ class XUIProtocolSync(ProtocolSyncBase):
         # нечем: update_client правит существующего клиента. Реконсиляция его
         # тоже не увидит — она выбирает по статусу "error". Логируем, чтобы
         # такие записи не застревали молча.
-        panel_uuids = {c.get("id", "") for c in xui_clients}
-        for conn in existing_connections:
-            if (
-                conn.sync_status == "pending_push"
-                and getattr(conn, "uuid", None) not in panel_uuids
-            ):
+        panel_uuids = {c.get("id") for c in xui_clients if c.get("id")}
+        orphaned = [
+            conn
+            for conn in existing_connections
+            if conn.sync_status == "pending_push"
+            and getattr(conn, "uuid", None) not in panel_uuids
+        ]
+        if orphaned:
+            for conn in orphaned:
                 logger.warning(
                     "Подключение {} ждёт отправки, но отсутствует на панели inbound {} — "
-                    "досылка невозможна, требуется вмешательство",
+                    "досылка невозможна",
                     conn.id, inbound.id,
                 )
-
-        if push_provider is not None:
-            await push_provider.close()
+            await self._notify_stuck(session, inbound, orphaned)
 
         await session.flush()
         logger.info("Синхронизировано {} клиентов для inbound {}", synced_count, inbound.id)
         return synced_count
 
+    async def _notify_stuck(self, session, inbound: "Inbound", orphaned: list) -> None:
+        """Сообщить админам о застрявших подключениях.
+
+        Подключение, ждущее отправки и отсутствующее на панели, дослать нечем:
+        ``update_client`` правит существующего клиента. Реконсиляция его тоже не
+        подхватит — она выбирает записи по статусу ``error``. Без уведомления
+        такое застревало бы навсегда, а за подписку могли уже заплатить.
+        """
+        from app.services.notification_service import NotificationService
+
+        marked = [
+            {
+                "email": getattr(conn, "email", None) or f"connection {conn.id}",
+                "user": conn.subscription.client.name
+                if conn.subscription and conn.subscription.client
+                else "—",
+            }
+            for conn in orphaned
+        ]
+        try:
+            await NotificationService(session).notify_admins_missing_on_panel(
+                server_name=inbound.server.name,
+                marked_connections=marked,
+            )
+        except Exception as e:
+            logger.error("Не удалось уведомить о застрявших подключениях: {}", e)
+
     async def _push_pending(self, inbound: "Inbound", conn, provider) -> bool:
         """Дослать на панель локальное состояние подключения.
 
-        Источник истины — подписка: на ней живут срок, лимит и признак
-        активности. У подключения ``is_enabled`` после неудачной попытки
-        отражает панель, а не намерение админа, поэтому опираться на него нельзя.
+        В статусе ``pending_push`` строка хранит **желаемое** состояние, а не
+        то, что на сервере: ``is_enabled`` — намерение админа, срок и лимит
+        берутся из подписки. Поэтому досылается строка как есть — угадывать
+        намерение из подписки нельзя, иначе индивидуально выключённое
+        подключение мультиинбаундной подписки будет включено обратно.
 
-        Признак ``pending_push`` снимается только после подтверждения панелью;
-        иначе следующий цикл повторит попытку.
+        Признак снимается только после подтверждения панелью; иначе следующий
+        цикл повторит попытку.
         """
         sub = conn.subscription
         if sub is None:
             logger.warning("Подключение {} без подписки — досылать нечего", conn.id)
             return False
 
-        expiry = sub.expiry_date
-        if expiry and expiry.tzinfo is None:
-            expiry = expiry.replace(tzinfo=UTC)
-        desired_enabled = bool(sub.is_active) and not (expiry and datetime.now(UTC) > expiry)
+        # SQLite отдаёт naive-время, а провайдер делает .timestamp(): без
+        # нормализации срок уезжает на локальное смещение от UTC.
+        expiry = ensure_utc(sub.expiry_date)
 
-        previous_enabled = conn.is_enabled
-        conn.is_enabled = desired_enabled
         try:
-            applied = await provider.update_client(inbound, conn, sub.total_gb, sub.expiry_date)
+            applied = await provider.update_client(inbound, conn, sub.total_gb, expiry)
         except Exception as e:
-            conn.is_enabled = previous_enabled
             logger.warning(
                 "Не удалось дослать подключение {} на панель: {} (повтор в следующем цикле)",
                 conn.id, e,
@@ -242,7 +274,6 @@ class XUIProtocolSync(ProtocolSyncBase):
             return False
 
         if not applied:
-            conn.is_enabled = previous_enabled
             logger.warning(
                 "Панель не подтвердила досылку подключения {} (повтор в следующем цикле)",
                 conn.id,
@@ -250,8 +281,9 @@ class XUIProtocolSync(ProtocolSyncBase):
             return False
 
         conn.total_gb = sub.total_gb
-        conn.expiry_date = sub.expiry_date
+        conn.expiry_date = expiry
         conn.sync_status = "synced"
+        conn.sync_error = None
         conn.last_sync_at = datetime.now(UTC)
         logger.info("Подключение {} дослано на панель", conn.id)
         return True

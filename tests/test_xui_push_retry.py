@@ -167,13 +167,13 @@ async def test_push_raising_keeps_pending(test_session, mock_settings, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_push_sends_subscription_intent(test_session, mock_settings, monkeypatch):
-    """Досылается намерение из подписки, а не устаревший флаг подключения.
+async def test_push_preserves_connection_intent(test_session, mock_settings, monkeypatch):
+    """Досылается строка как есть, а не состояние, выведенное из подписки.
 
-    После неудачной попытки отключения `is_enabled` откатывается к состоянию
-    панели, поэтому источником истины остаётся `subscription.is_active`.
+    У мультиинбаундной подписки подключение можно выключить индивидуально.
+    Если досылка возьмёт `sub.is_active`, такое подключение включится обратно.
     """
-    _, conn = await _setup(test_session, 998004, sub_active=False, conn_enabled=True)
+    _, conn = await _setup(test_session, 998004, sub_active=True, conn_enabled=False)
     seen = {}
 
     async def _capture(inbound, connection, *args, **kwargs):
@@ -182,64 +182,105 @@ async def test_push_sends_subscription_intent(test_session, mock_settings, monke
 
     provider = AsyncMock()
     provider.update_client = AsyncMock(side_effect=_capture)
-    provider.close = AsyncMock()
     monkeypatch.setattr(
         "app.services.vpn_providers.factory.get_vpn_provider", lambda *a, **k: provider
     )
 
     inbound = await _load_inbound(test_session, conn.inbound_id)
     await XUIProtocolSync().sync_clients(
-        test_session, inbound, xui_service=_panel(conn)
+        test_session, inbound, xui_service=_panel(conn, enable=False)
     )
 
-    assert seen["is_enabled"] is False, "в панель ушёл флаг подключения вместо намерения"
+    assert seen["is_enabled"] is False, "индивидуально выключенное подключение включено обратно"
     assert conn.is_enabled is False
 
 
 @pytest.mark.asyncio
-async def test_expired_subscription_is_pushed_as_disabled(
-    test_session, mock_settings, monkeypatch
-):
-    """Истёкшая подписка досылается как отключённая, даже если помечена активной."""
-    _, conn = await _setup(test_session, 998005, days_left=-3, conn_enabled=True)
-    seen = {}
+async def test_push_reuses_panel_client(test_session, mock_settings, monkeypatch):
+    """Провайдер должен получить уже аутентифицированного клиента.
 
-    async def _capture(inbound, connection, *args, **kwargs):
-        seen["is_enabled"] = connection.is_enabled
-        return True
-
-    provider = AsyncMock()
-    provider.update_client = AsyncMock(side_effect=_capture)
-    provider.close = AsyncMock()
-    monkeypatch.setattr(
-        "app.services.vpn_providers.factory.get_vpn_provider", lambda *a, **k: provider
-    )
-
-    inbound = await _load_inbound(test_session, conn.inbound_id)
-    await XUIProtocolSync().sync_clients(
-        test_session, inbound, xui_service=_panel(conn)
-    )
-
-    assert seen["is_enabled"] is False
-
-
-@pytest.mark.asyncio
-async def test_push_provider_is_closed(test_session, mock_settings, monkeypatch):
-    """Провайдер держит aiohttp-сессию к панели — цикл идёт каждые несколько минут."""
+    Иначе он логинится в панель заново на каждый inbound, а цикл идёт каждые
+    несколько минут.
+    """
     _, conn = await _setup(test_session, 998008)
     provider = AsyncMock()
     provider.update_client = AsyncMock(return_value=True)
-    provider.close = AsyncMock()
+    provider._client = None
     monkeypatch.setattr(
         "app.services.vpn_providers.factory.get_vpn_provider", lambda *a, **k: provider
     )
 
-    inbound = await _load_inbound(test_session, conn.inbound_id)
-    await XUIProtocolSync().sync_clients(
-        test_session, inbound, xui_service=_panel(conn)
-    )
+    service = _panel(conn)
+    expected_client = await service._get_client(None)
 
-    provider.close.assert_awaited_once()
+    inbound = await _load_inbound(test_session, conn.inbound_id)
+    await XUIProtocolSync().sync_clients(test_session, inbound, xui_service=service)
+
+    assert provider._client is expected_client, "провайдер логинится в панель заново"
+
+
+@pytest.mark.asyncio
+async def test_provider_created_once_per_inbound(test_session, mock_settings, monkeypatch):
+    """Провайдер создаётся один раз на inbound, а не на каждое подключение.
+
+    С одним застрявшим подключением это неотличимо, поэтому в очереди два.
+    """
+    sub, conn = await _setup(test_session, 998009)
+    # Уникальность (subscription_id, inbound_id) — второму подключению на том же
+    # inbound нужна своя подписка.
+    sub2 = Subscription(
+        client_id=sub.client_id,
+        name="sub2",
+        subscription_token="tok998009b",
+        total_gb=10,
+        expiry_date=sub.expiry_date,
+        is_active=True,
+    )
+    test_session.add(sub2)
+    await test_session.flush()
+    second = XUIInboundConnection(
+        subscription_id=sub2.id,
+        inbound_id=conn.inbound_id,
+        is_enabled=True,
+        email="second@example.com",
+        uuid="uuid-998009-b",
+        expiry_date=sub.expiry_date,
+        sync_status=PENDING_PUSH,
+    )
+    test_session.add(second)
+    await test_session.flush()
+
+    provider = AsyncMock()
+    provider.update_client = AsyncMock(return_value=True)
+    calls = {"n": 0}
+
+    def _factory(*args, **kwargs):
+        calls["n"] += 1
+        return provider
+
+    monkeypatch.setattr("app.services.vpn_providers.factory.get_vpn_provider", _factory)
+
+    xui_client = AsyncMock()
+    xui_client.get_inbound = AsyncMock(
+        return_value=SimpleNamespace(
+            settings=json.dumps(
+                {
+                    "clients": [
+                        {"id": conn.uuid, "enable": True, "totalGB": 0, "expiryTime": 0},
+                        {"id": second.uuid, "enable": True, "totalGB": 0, "expiryTime": 0},
+                    ]
+                }
+            )
+        )
+    )
+    service = AsyncMock()
+    service._get_client = AsyncMock(return_value=xui_client)
+
+    inbound = await _load_inbound(test_session, conn.inbound_id)
+    await XUIProtocolSync().sync_clients(test_session, inbound, xui_service=service)
+
+    assert provider.update_client.await_count == 2, "досланы не оба подключения"
+    assert calls["n"] == 1, "провайдер создаётся на каждое подключение — лишние логины"
 
 
 @pytest.mark.asyncio
@@ -258,6 +299,13 @@ async def test_missing_from_panel_is_logged(test_session, mock_settings, monkeyp
         "app.services.vpn_providers.factory.get_vpn_provider", lambda *a, **k: provider
     )
 
+    notify = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.notification_service.NotificationService."
+        "notify_admins_missing_on_panel",
+        notify,
+    )
+
     # На панели другой клиент — нашего там нет.
     other = SimpleNamespace(uuid="uuid-someone-else")
     messages: list[str] = []
@@ -272,6 +320,7 @@ async def test_missing_from_panel_is_logged(test_session, mock_settings, monkeyp
 
     provider.update_client.assert_not_awaited()
     assert any("отсутствует на панели" in m for m in messages), messages
+    notify.assert_awaited_once(), "админам не ушло уведомление о застрявшем подключении"
 
 
 @pytest.mark.asyncio

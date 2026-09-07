@@ -193,7 +193,9 @@ async def test_failed_status_change_marks_pending_push(
     await NewSubscriptionService(test_session).update_subscription(sub.id, is_active=False)
 
     assert conn.sync_status == PENDING_PUSH
-    assert conn.is_enabled is True, "флаг не должен переворачиваться без панели"
+    # Строка в pending_push хранит намерение админа, а не состояние панели:
+    # именно его досылает синхронизация. Что оно ещё не применено, говорит статус.
+    assert conn.is_enabled is False, "намерение должно сохраниться для досылки"
 
 
 # --- C3: жёсткий отказ вместо тихого частичного успеха ---------------------

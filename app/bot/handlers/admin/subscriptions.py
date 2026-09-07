@@ -1787,7 +1787,10 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
                         logger.warning(
                             "Сервер не подтвердил {} подключения {}", action, conn.id
                         )
-                        conn.sync_status = "error"
+                        # Не понижаем pending_push до error: реконсиляция лечит
+                        # именно error, и непрошедшее изменение было бы потеряно.
+                        if conn.sync_status != "pending_push":
+                            conn.sync_status = "error"
                         continue
 
                     conn.is_enabled = new_state

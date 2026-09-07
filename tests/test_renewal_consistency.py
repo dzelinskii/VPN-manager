@@ -230,7 +230,8 @@ async def test_xui_status_not_flipped_when_panel_fails(test_session, mock_settin
 
     await NewSubscriptionService(test_session).update_subscription(sub.id, is_active=False)
 
-    assert conn.is_enabled is True, "флаг перевёрнут без подтверждения панели"
+    # Флаг — намерение админа, статус говорит, что оно не применено.
+    assert conn.is_enabled is False, "намерение должно сохраниться для досылки"
     assert conn.sync_status == "pending_push"
 
 
