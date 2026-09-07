@@ -10,7 +10,7 @@ from loguru import logger
 
 from app.bot.filters import AdminFilter
 from app.database import async_session_factory
-from app.services.pricing import resolve_price
+from app.services.pricing import format_price, resolve_price
 from app.services.renewal_service import (
     AlreadyRenewedError,
     RenewalService,
@@ -23,15 +23,6 @@ router.callback_query.filter(AdminFilter())
 
 _PER_PAGE = 5
 _DUE_WINDOW_DAYS = 7
-
-
-def _format_amount(amount: int | None) -> str:
-    """Сумма для показа админу."""
-    if amount is None:
-        return "цена не задана"
-    if amount == 0:
-        return "бесплатно"
-    return f"{amount / 100:.2f} ₽"
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -76,7 +67,7 @@ async def _show_list(callback: CallbackQuery, page: int) -> None:
         for sub in page_items:
             lines.append(
                 f"👤 <b>{html.escape(sub.client.name)}</b> — {html.escape(sub.name)}\n"
-                f"   {_format_expiry(sub.expiry_date)}, {_format_amount(resolve_price(sub))}"
+                f"   {_format_expiry(sub.expiry_date)}, {format_price(resolve_price(sub))}"
             )
         markup = _list_keyboard(page_items, page, len(due)).as_markup()
 
@@ -127,7 +118,7 @@ async def renew_subscription(callback: CallbackQuery) -> None:
             await callback.answer("❌ Ошибка продления, см. логи", show_alert=True)
             return
 
-    text = f"✅ Продлено на 30 дн., {_format_amount(result.amount_kopecks)}"
+    text = f"✅ Продлено на 30 дн., {format_price(result.amount_kopecks)}"
     if result.failed_connections:
         text += f"\n⚠️ Не применилось подключений: {result.failed_connections}"
     await callback.answer(text, show_alert=bool(result.failed_connections))
