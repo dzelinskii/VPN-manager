@@ -29,6 +29,15 @@ class SubscriptionNotFoundError(Exception):
     """Подписка исчезла между отрисовкой списка и нажатием."""
 
 
+class StaleRenewalError(Exception):
+    """Состояние подписки изменилось после отрисовки списка.
+
+    Ключ идемпотентности строится из даты окончания, поэтому продлевать по
+    устаревшей кнопке нельзя: при сдвинутой дате получится второй платёж и
+    двойной срок, при откаченной — конфликт ключа.
+    """
+
+
 @dataclass
 class RenewalResult:
     """Итог продления."""
@@ -84,6 +93,16 @@ class RenewalService:
         if subscription is None:
             raise SubscriptionNotFoundError(f"Подписка {subscription_id} не найдена")
 
+        if not subscription.is_active:
+            raise StaleRenewalError(f"Подписка {subscription_id} отключена")
+
+        if subscription.expiry_date is None or self._seconds(
+            subscription.expiry_date
+        ) != self._seconds(expected_expiry):
+            raise StaleRenewalError(
+                f"Срок подписки {subscription_id} изменился после отрисовки списка"
+            )
+
         amount = resolve_price(subscription) or 0
         key = self._idempotency_key(subscription_id, expected_expiry)
 
@@ -119,10 +138,20 @@ class RenewalService:
         )
 
     @staticmethod
-    def _idempotency_key(subscription_id: int, expiry: datetime) -> str:
-        """Ключ вида ``manual:<id>:<дата окончания в UTC ISO>``."""
-        normalized = expiry if expiry.tzinfo else expiry.replace(tzinfo=UTC)
-        return f"manual:{subscription_id}:{normalized.astimezone(UTC).isoformat()}"
+    def _seconds(value: datetime) -> int:
+        """Момент времени с точностью до секунды.
+
+        Кнопка несёт целые секунды, в БД могут лежать микросекунды — сравнивать
+        и строить ключ надо по общему знаменателю, иначе прод и тесты работают
+        с разными ключами.
+        """
+        normalized = value if value.tzinfo else value.replace(tzinfo=UTC)
+        return int(normalized.timestamp())
+
+    @classmethod
+    def _idempotency_key(cls, subscription_id: int, expiry: datetime) -> str:
+        """Ключ вида ``manual:<id>:<unix-секунды прежней даты окончания>``."""
+        return f"manual:{subscription_id}:{cls._seconds(expiry)}"
 
     async def _count_failed_connections(self, subscription_id: int) -> int:
         result = await self.session.execute(

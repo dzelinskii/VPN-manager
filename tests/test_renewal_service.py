@@ -89,7 +89,13 @@ async def test_renew_extends_and_records_payment(test_session, mock_settings, mo
 
 @pytest.mark.asyncio
 async def test_second_tap_does_not_extend_twice(test_session, mock_settings, monkeypatch):
-    """Повтор по устаревшему сообщению несёт ту же прежнюю дату — значит тот же ключ."""
+    """Повтор по устаревшему сообщению не должен продлевать второй раз.
+
+    После первого продления дата уехала вперёд, поэтому срабатывает проверка
+    актуальности — она стоит раньше ключа идемпотентности.
+    """
+    from app.services.renewal_service import StaleRenewalError
+
     sub, _ = await _setup(test_session, 992002)
     old_expiry = sub.expiry_date
     monkeypatch.setattr(
@@ -100,12 +106,46 @@ async def test_second_tap_does_not_extend_twice(test_session, mock_settings, mon
     await service.renew(sub.id, old_expiry)
     expiry_after_first = sub.expiry_date
 
-    with pytest.raises(AlreadyRenewedError):
+    with pytest.raises(StaleRenewalError):
         await service.renew(sub.id, old_expiry)
 
     assert sub.expiry_date == expiry_after_first
     payments = (await test_session.execute(select(Payment))).scalars().all()
     assert len(payments) == 1
+
+
+@pytest.mark.asyncio
+async def test_taken_idempotency_key_blocks_renewal(test_session, mock_settings, monkeypatch):
+    """Занятый ключ останавливает продление — это защита от гонки двух тапов.
+
+    Проверка актуальности ловит последовательный повтор, а ключ — параллельный,
+    когда обе задачи прошли её с одинаковой датой.
+    """
+    sub, _ = await _setup(test_session, 992010)
+    monkeypatch.setattr(
+        "app.services.new_subscription_service.get_vpn_provider", lambda *a, **k: _provider()
+    )
+
+    service = RenewalService(test_session)
+    test_session.add(
+        Payment(
+            subscription_id=sub.id,
+            client_id=sub.client_id,
+            amount_kopecks=34990,
+            currency="RUB",
+            method="manual",
+            status="succeeded",
+            period_days=30,
+            idempotency_key=service._idempotency_key(sub.id, sub.expiry_date),
+        )
+    )
+    await test_session.flush()
+    before = sub.expiry_date
+
+    with pytest.raises(AlreadyRenewedError):
+        await service.renew(sub.id, sub.expiry_date)
+
+    assert sub.expiry_date == before
 
 
 @pytest.mark.asyncio

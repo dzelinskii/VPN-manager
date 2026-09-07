@@ -827,10 +827,20 @@ class NewSubscriptionService:
                 await self.session.flush()
                 return connection
         else:
+            previous_enabled = connection.is_enabled
             connection.is_enabled = enable
-            await provider.update_client(
-                inbound, connection, connection.total_gb, connection.expiry_date
-            )
+            try:
+                await provider.update_client(
+                    inbound, connection, connection.total_gb, connection.expiry_date
+                )
+            except Exception as e:
+                connection.is_enabled = previous_enabled
+                connection.sync_status = "error"
+                logger.warning(
+                    "Не удалось переключить connection {} на панели: {}", connection.id, e
+                )
+                await self.session.flush()
+                return connection
 
         connection.is_enabled = enable
         await self.session.flush()
@@ -892,9 +902,22 @@ class NewSubscriptionService:
                         connection.sync_status = "error"
                         continue
                 else:
-                    await provider.update_client(
-                        inbound, connection, connection.total_gb, connection.expiry_date
-                    )
+                    # Новый флаг выставляем до вызова: XUI-провайдер читает его
+                    # из объекта. При отказе панели возвращаем прежний.
+                    previous_enabled = connection.is_enabled
+                    connection.is_enabled = enable
+                    try:
+                        await provider.update_client(
+                            inbound, connection, connection.total_gb, connection.expiry_date
+                        )
+                    except Exception as e:
+                        connection.is_enabled = previous_enabled
+                        connection.sync_status = "error"
+                        logger.warning(
+                            "Не удалось переключить connection {} на панели: {}",
+                            connection.id, e,
+                        )
+                        continue
 
                 connection.is_enabled = enable
                 toggled_count += 1
@@ -1290,13 +1313,21 @@ class NewSubscriptionService:
                             continue
                         connection.is_enabled = subscription.is_active
                     else:
+                        # XUI-провайдер берёт enable из объекта, поэтому новое
+                        # значение нужно выставить до вызова — и вернуть назад,
+                        # если панель его не приняла.
+                        previous_enabled = connection.is_enabled
                         connection.is_enabled = subscription.is_active
-                        await provider.update_client(
-                            connection.inbound,
-                            connection,
-                            subscription.total_gb,
-                            subscription.expiry_date,
-                        )
+                        try:
+                            await provider.update_client(
+                                connection.inbound,
+                                connection,
+                                subscription.total_gb,
+                                subscription.expiry_date,
+                            )
+                        except Exception:
+                            connection.is_enabled = previous_enabled
+                            raise
 
                     # Update per-connection settings
                     connection.total_gb = subscription.total_gb
