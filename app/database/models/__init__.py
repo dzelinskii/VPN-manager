@@ -14,6 +14,7 @@ from app.database.models.notification_log import (
     NotificationLog,
     NotificationType,
 )
+from app.database.models.payment import Payment
 from app.database.models.pending_divergence import PendingDivergence
 from app.database.models.server import Server
 from app.database.models.services import AWGService, MTProxyService, XUIPanel
@@ -36,6 +37,7 @@ __all__ = [
     "MTProxyInbound",
     "Subscription",
     "SubscriptionRequest",
+    "Payment",
     "PendingDivergence",
     "InboundConnection",
     "XUIInboundConnection",
