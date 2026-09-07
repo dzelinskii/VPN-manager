@@ -30,9 +30,11 @@ class TestParseRejectsSpecials:
         with pytest.raises(ValueError):
             parse_price_kopecks(value)
 
-    def test_rejects_absurdly_large(self):
+    @pytest.mark.parametrize("value", ["1e1000", "1e999999", "1e100000000", "1E+999999999"])
+    def test_rejects_absurdly_large(self, value):
+        """За пределами Emax Decimal бросает Overflow — тоже не ValueError."""
         with pytest.raises(ValueError):
-            parse_price_kopecks("1e1000")
+            parse_price_kopecks(value)
 
     def test_rejects_above_limit(self):
         with pytest.raises(ValueError):

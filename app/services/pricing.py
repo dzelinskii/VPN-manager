@@ -51,6 +51,10 @@ def parse_price_kopecks(text: str) -> int:
         rubles = Decimal(cleaned)
     except InvalidOperation as e:
         raise ValueError("Не похоже на число") from e
+    except ArithmeticError as e:
+        # Экспоненты за пределами Emax дают decimal.Overflow — это тоже
+        # ArithmeticError, а вызывающие ловят только ValueError.
+        raise ValueError("Слишком большое число") from e
 
     # Decimal принимает inf и nan, а дальше они ломают и сравнение, и exponent.
     if not rubles.is_finite():
@@ -60,7 +64,11 @@ def parse_price_kopecks(text: str) -> int:
     if -rubles.as_tuple().exponent > 2:
         raise ValueError("Копейка — минимальная единица, больше двух знаков после точки нельзя")
 
-    kopecks = int(rubles * 100)
+    try:
+        kopecks = int(rubles * 100)
+    except ArithmeticError as e:
+        raise ValueError("Слишком большое число") from e
+
     if kopecks > MAX_PRICE_KOPECKS:
         raise ValueError(f"Слишком большая цена, максимум {MAX_PRICE_KOPECKS // 100} ₽")
 

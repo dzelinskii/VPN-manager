@@ -116,7 +116,9 @@ async def test_unset_price_asks_before_renewing(test_session, mock_settings, mon
     await renewals.renew_subscription(callback)
 
     assert "не задана цена" in (callback.message.text or "")
-    payments = (await test_session.execute(select(Payment))).scalars().all()
+    payments = (
+        await test_session.execute(select(Payment).where(Payment.subscription_id == sub.id))
+    ).scalars().all()
     assert payments == [], "продление не должно происходить до подтверждения"
 
 
@@ -140,7 +142,10 @@ async def test_known_price_renews_without_asking(test_session, mock_settings, mo
     callback = _FakeCallback(f"renew:do:{sub.id}:{ts}")
     await renewals.renew_subscription(callback)
 
-    assert not any("не задана цена" in (a or "") for a in callback.answers)
-    payments = (await test_session.execute(select(Payment))).scalars().all()
+    # Предупреждение уходит в edit_text, а не в answer — проверяем именно его.
+    assert "не задана цена" not in (callback.message.text or "")
+    payments = (
+        await test_session.execute(select(Payment).where(Payment.subscription_id == sub.id))
+    ).scalars().all()
     assert len(payments) == 1
     assert payments[0].amount_kopecks == 34990

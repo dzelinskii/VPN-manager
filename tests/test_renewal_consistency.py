@@ -120,7 +120,9 @@ async def test_renew_rejects_stale_expiry(test_session, mock_settings, monkeypat
         await RenewalService(test_session).renew(sub.id, stale)
 
     assert sub.expiry_date == before, "срок не должен меняться"
-    payments = (await test_session.execute(select(Payment))).scalars().all()
+    payments = (
+        await test_session.execute(select(Payment).where(Payment.subscription_id == sub.id))
+    ).scalars().all()
     assert payments == [], "платёж не должен записываться"
 
 
@@ -151,7 +153,9 @@ async def test_renew_rejects_inactive_subscription(test_session, mock_settings, 
     with pytest.raises(StaleRenewalError):
         await RenewalService(test_session).renew(sub.id, sub.expiry_date)
 
-    payments = (await test_session.execute(select(Payment))).scalars().all()
+    payments = (
+        await test_session.execute(select(Payment).where(Payment.subscription_id == sub.id))
+    ).scalars().all()
     assert payments == []
 
 
