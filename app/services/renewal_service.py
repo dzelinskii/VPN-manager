@@ -162,7 +162,7 @@ class RenewalService:
         result = await self.session.execute(
             select(InboundConnection).where(
                 InboundConnection.subscription_id == subscription_id,
-                InboundConnection.sync_status == "error",
+                InboundConnection.sync_status.in_(("error", "pending_push")),
             )
         )
         return len(list(result.scalars().all()))

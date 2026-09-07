@@ -168,7 +168,7 @@ async def test_xui_sync_does_not_revert_unpushed_expiry(test_session, mock_setti
     local_expiry = datetime.now(UTC) + timedelta(days=33)
     sub.expiry_date = local_expiry
     conn.expiry_date = local_expiry
-    conn.sync_status = "error"  # push на панель не прошёл
+    conn.sync_status = "pending_push"  # push на панель не прошёл
     await test_session.flush()
 
     panel_expiry_ms = int((datetime.now(UTC) + timedelta(days=3)).timestamp() * 1000)
@@ -219,7 +219,7 @@ async def test_xui_status_not_flipped_when_panel_fails(test_session, mock_settin
     await NewSubscriptionService(test_session).update_subscription(sub.id, is_active=False)
 
     assert conn.is_enabled is True, "флаг перевёрнут без подтверждения панели"
-    assert conn.sync_status == "error"
+    assert conn.sync_status == "pending_push"
 
 
 # --- C3: массовое переключение подключений клиента -------------------------
@@ -258,12 +258,12 @@ async def test_toggle_all_keeps_flag_when_panel_fails(test_session, mock_setting
         "app.services.new_subscription_service.get_vpn_provider", lambda *a, **k: provider
     )
 
-    await NewSubscriptionService(test_session).toggle_client_all_connections(
-        sub.client_id, enable=False
-    )
+    with pytest.raises(TimeoutError):
+        await NewSubscriptionService(test_session).toggle_client_all_connections(
+            sub.client_id, enable=False
+        )
 
-    assert conn.is_enabled is True
-    assert conn.sync_status == "error"
+    assert conn.is_enabled is True, "флаг должен вернуться к прежнему значению"
 
 
 @pytest.mark.asyncio
@@ -276,7 +276,7 @@ async def test_toggle_single_keeps_flag_when_panel_fails(test_session, mock_sett
         "app.services.new_subscription_service.get_vpn_provider", lambda *a, **k: provider
     )
 
-    await NewSubscriptionService(test_session).toggle_inbound_connection(conn.id, False)
+    with pytest.raises(TimeoutError):
+        await NewSubscriptionService(test_session).toggle_inbound_connection(conn.id, False)
 
-    assert conn.is_enabled is True
-    assert conn.sync_status == "error"
+    assert conn.is_enabled is True, "флаг должен вернуться к прежнему значению"

@@ -833,14 +833,11 @@ class NewSubscriptionService:
                 await provider.update_client(
                     inbound, connection, connection.total_gb, connection.expiry_date
                 )
-            except Exception as e:
+            except Exception:
+                # Отказ жёсткий: иначе хэндлер отрапортует «включено» в ответ на
+                # неудавшуюся попытку отключить.
                 connection.is_enabled = previous_enabled
-                connection.sync_status = "error"
-                logger.warning(
-                    "Не удалось переключить connection {} на панели: {}", connection.id, e
-                )
-                await self.session.flush()
-                return connection
+                raise
 
         connection.is_enabled = enable
         await self.session.flush()
@@ -910,14 +907,12 @@ class NewSubscriptionService:
                         await provider.update_client(
                             inbound, connection, connection.total_gb, connection.expiry_date
                         )
-                    except Exception as e:
+                    except Exception:
+                        # Отказ жёсткий: вызывающий откатывает транзакцию целиком.
+                        # Проглатывать нельзя — получится наполовину отключённый
+                        # клиент с рапортом об успехе.
                         connection.is_enabled = previous_enabled
-                        connection.sync_status = "error"
-                        logger.warning(
-                            "Не удалось переключить connection {} на панели: {}",
-                            connection.id, e,
-                        )
-                        continue
+                        raise
 
                 connection.is_enabled = enable
                 toggled_count += 1
@@ -1339,7 +1334,10 @@ class NewSubscriptionService:
                         "Не удалось обновить VPN-клиент для connection {}: {}",
                         connection.id, e,
                     )
-                    connection.sync_status = "error"
+                    # Намерение админа (is_active) остаётся в БД, но на сервер не
+                    # доехало: помечаем, чтобы синхронизация это не затёрла и
+                    # чтобы хэндлер мог сказать правду вместо «✅ отключено».
+                    connection.sync_status = "pending_push"
 
             await self.session.flush()
 
@@ -1424,13 +1422,16 @@ class NewSubscriptionService:
                             "Сервер не подтвердил включение connection {} после продления",
                             connection.id,
                         )
-                        connection.sync_status = "error"
+                        connection.sync_status = "pending_push"
             except Exception as e:
                 logger.warning(
                     "Не удалось обновить VPN-клиент для connection {}: {}",
                     connection.id, e,
                 )
-                connection.sync_status = "error"
+                # Новый срок уже в БД, но на сервере его нет — помечаем именно
+                # pending_push, иначе реконсиляция вылечит статус и следующий
+                # цикл откатит срок по данным панели.
+                connection.sync_status = "pending_push"
 
         await self.session.flush()
         updated = await self.get_subscription(subscription_id)
