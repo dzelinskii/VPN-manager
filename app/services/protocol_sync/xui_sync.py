@@ -13,6 +13,9 @@ from app.services.protocol_sync import ProtocolSyncBase, register
 from app.utils.date_utils import ensure_utc
 from app.xui_client.models import ensure_settings_dict
 
+# Причина в sync_error, она же признак «об этом уже уведомляли».
+_MISSING_ON_PANEL = "missing_on_panel"
+
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -194,23 +197,31 @@ class XUIProtocolSync(ProtocolSyncBase):
 
         # Подключение, ждущее отправки, но отсутствующее на панели, дослать
         # нечем: update_client правит существующего клиента. Реконсиляция его
-        # тоже не увидит — она выбирает по статусу "error". Логируем, чтобы
-        # такие записи не застревали молча.
-        panel_uuids = {c.get("id") for c in xui_clients if c.get("id")}
-        orphaned = [
-            conn
-            for conn in existing_connections
-            if conn.sync_status == "pending_push"
-            and getattr(conn, "uuid", None) not in panel_uuids
-        ]
-        if orphaned:
+        # тоже не увидит — она выбирает по статусу "error".
+        #
+        # Пустой снимок не отличить от мягкого сбоя панели (так же осторожничает
+        # реконсиляция), поэтому по нему выводов не делаем.
+        if xui_clients:
+            panel_uuids = {c.get("id") for c in xui_clients if c.get("id")}
+            orphaned = [
+                conn
+                for conn in existing_connections
+                if conn.sync_status == "pending_push"
+                and getattr(conn, "uuid", None) not in panel_uuids
+            ]
+            # Уведомляем один раз на переход: состояние само не рассасывается, а
+            # цикл идёт каждые несколько минут — иначе админ получал бы сотни
+            # сообщений в сутки, и настоящие оповещения утонули бы.
+            fresh = [c for c in orphaned if c.sync_error != _MISSING_ON_PANEL]
             for conn in orphaned:
                 logger.warning(
                     "Подключение {} ждёт отправки, но отсутствует на панели inbound {} — "
                     "досылка невозможна",
                     conn.id, inbound.id,
                 )
-            await self._notify_stuck(session, inbound, orphaned)
+                conn.sync_error = _MISSING_ON_PANEL
+            if fresh:
+                await self._notify_stuck(session, inbound, fresh)
 
         await session.flush()
         logger.info("Синхронизировано {} клиентов для inbound {}", synced_count, inbound.id)
@@ -236,9 +247,9 @@ class XUIProtocolSync(ProtocolSyncBase):
             for conn in orphaned
         ]
         try:
-            await NotificationService(session).notify_admins_missing_on_panel(
+            await NotificationService(session).notify_admins_stuck_pending_push(
                 server_name=inbound.server.name,
-                marked_connections=marked,
+                stuck_connections=marked,
             )
         except Exception as e:
             logger.error("Не удалось уведомить о застрявших подключениях: {}", e)

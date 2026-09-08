@@ -302,7 +302,7 @@ async def test_missing_from_panel_is_logged(test_session, mock_settings, monkeyp
     notify = AsyncMock()
     monkeypatch.setattr(
         "app.services.notification_service.NotificationService."
-        "notify_admins_missing_on_panel",
+        "notify_admins_stuck_pending_push",
         notify,
     )
 
@@ -320,7 +320,7 @@ async def test_missing_from_panel_is_logged(test_session, mock_settings, monkeyp
 
     provider.update_client.assert_not_awaited()
     assert any("отсутствует на панели" in m for m in messages), messages
-    notify.assert_awaited_once(), "админам не ушло уведомление о застрявшем подключении"
+    assert notify.await_count == 1, "админам не ушло уведомление о застрявшем подключении"
 
 
 @pytest.mark.asyncio

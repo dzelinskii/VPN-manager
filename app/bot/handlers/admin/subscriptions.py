@@ -637,6 +637,17 @@ async def create_subscription(callback: CallbackQuery, state: FSMContext) -> Non
 # Additional subscription management handlers
 
 
+def _conn_status_icon(conn) -> str:
+    """Значок состояния подключения.
+
+    В статусе pending_push строка хранит намерение админа, а не то, что на
+    сервере, — иначе интерфейс показывал бы применённым то, чего на панели нет.
+    """
+    if getattr(conn, "sync_status", None) == "pending_push":
+        return "⏳"
+    return "✅" if conn.is_enabled else "❌"
+
+
 async def _count_pending_push(session, subscription_id: int) -> int:
     """Сколько подключений подписки не доехало до сервера.
 
@@ -928,7 +939,7 @@ async def show_subscription_inbounds(callback: CallbackQuery) -> None:
     builder = InlineKeyboardBuilder()
 
     for conn in connections:
-        status = "✅" if conn.is_enabled else "❌"
+        status = _conn_status_icon(conn)
         inbound = conn.inbound
         server = inbound.server
 
@@ -1484,7 +1495,7 @@ async def toggle_inbound_connection(callback: CallbackQuery) -> None:
             builder = InlineKeyboardBuilder()
 
             for conn in connections:
-                conn_status = "✅" if conn.is_enabled else "❌"
+                conn_status = _conn_status_icon(conn)
                 inbound = conn.inbound
                 server = inbound.server
 
@@ -1787,8 +1798,10 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
                         logger.warning(
                             "Сервер не подтвердил {} подключения {}", action, conn.id
                         )
-                        # Не понижаем pending_push до error: реконсиляция лечит
-                        # именно error, и непрошедшее изменение было бы потеряно.
+                        # Не затираем pending_push: он помечает неотправленное
+                        # изменение и учитывается в счётчике «не применилось».
+                        # Ветка достижима только для AWG/MTProxy — XUI-провайдер
+                        # сообщает об отказе исключением, а не False.
                         if conn.sync_status != "pending_push":
                             conn.sync_status = "error"
                         continue
@@ -1824,7 +1837,7 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
             builder = InlineKeyboardBuilder()
 
             for conn in updated_connections:
-                status = "✅" if conn.is_enabled else "❌"
+                status = _conn_status_icon(conn)
                 inbound = conn.inbound
                 server = inbound.server
 
@@ -1967,7 +1980,7 @@ async def exit_multi_select_mode(callback: CallbackQuery, state: FSMContext) -> 
     builder = InlineKeyboardBuilder()
 
     for conn in connections:
-        status = "✅" if conn.is_enabled else "❌"
+        status = _conn_status_icon(conn)
         inbound = conn.inbound
         server = inbound.server
 

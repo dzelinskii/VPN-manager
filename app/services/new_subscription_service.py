@@ -1294,26 +1294,39 @@ class NewSubscriptionService:
                     # отдельные enable_client/disable_client. У XUI флаг enable
                     # едет внутри update_client.
                     if connection.inbound.type in ("awg_inbound", "mtproxy_inbound"):
-                        if subscription.is_active:
-                            applied = await provider.enable_client(connection.inbound, connection)
-                        else:
-                            applied = await provider.disable_client(connection.inbound, connection)
-                        if not applied:
-                            logger.warning(
-                                "Сервер не подтвердил смену статуса connection {} — "
-                                "оставляю прежний статус",
-                                connection.id,
-                            )
-                            connection.sync_status = "error"
-                            continue
-                        connection.is_enabled = subscription.is_active
+                        # Статус трогаем только когда его и правда меняли:
+                        # правка трафика или срока не должна включать обратно
+                        # индивидуально выключенное подключение.
+                        if is_active is not None:
+                            if subscription.is_active:
+                                applied = await provider.enable_client(
+                                    connection.inbound, connection
+                                )
+                            else:
+                                applied = await provider.disable_client(
+                                    connection.inbound, connection
+                                )
+                            if not applied:
+                                logger.warning(
+                                    "Сервер не подтвердил смену статуса connection {} — "
+                                    "оставляю прежний статус",
+                                    connection.id,
+                                )
+                                connection.sync_status = "error"
+                                continue
+                            connection.is_enabled = subscription.is_active
                     else:
-                        # Флаг остаётся намерением админа даже при отказе панели:
-                        # строка в статусе pending_push хранит желаемое
-                        # состояние, а досылка отправит её как есть. Откатывать
-                        # нельзя — иначе намерение потеряется и досылать будет
-                        # нечего.
-                        connection.is_enabled = subscription.is_active
+                        # Флаг трогаем только когда статус подписки и правда
+                        # меняли: подключение можно выключить индивидуально, и
+                        # правка трафика или срока не должна его воскрешать —
+                        # тем более что досылка отправит строку на панель как есть.
+                        #
+                        # При смене статуса флаг остаётся намерением админа даже
+                        # при отказе панели: строка в pending_push хранит
+                        # желаемое состояние, откатывать нельзя — иначе
+                        # намерение потеряется и досылать будет нечего.
+                        if is_active is not None:
+                            connection.is_enabled = subscription.is_active
                         await provider.update_client(
                             connection.inbound,
                             connection,
