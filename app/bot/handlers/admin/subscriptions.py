@@ -21,7 +21,7 @@ from app.bot.keyboards import (
 )
 from app.bot.states.admin import SubscriptionManagement, SubscriptionRebuild
 from app.database import async_session_factory
-from app.database.models import Inbound
+from app.database.models import Inbound, Subscription
 from app.services.client_service import ClientService
 from app.services.pricing import (
     format_price,
@@ -982,16 +982,15 @@ async def show_subscription_inbounds(callback: CallbackQuery) -> None:
             conn_id=conn.id,
         )
 
-        if conn.is_enabled:
-            builder.button(
-                text=f"✅ {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
-        else:
-            builder.button(
-                text=f"🔌 {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
+        # Значок тот же, что в тексте выше: иначе в одной строке два разных
+        # сигнала о состоянии подключения.
+        icon = "⏳" if getattr(conn, "sync_status", None) == "pending_push" else (
+            "✅" if conn.is_enabled else "🔌"
+        )
+        builder.button(
+            text=f"{icon} {inbound.remark} ({inbound.protocol})",
+            callback_data=f"toggle_conn_{conn.id}",
+        )
         builder.button(text="🗑️", callback_data=f"delete_conn_{conn.id}")
         if conn.type in ("awg_inbound_connection", "mtproxy_inbound_connection"):
             builder.button(
@@ -1759,6 +1758,12 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
                 selectinload(InboundConnection.inbound)
                 .selectinload(Inbound.server)
                 .selectinload(ServerModel.mtproxy_service),
+                # XUI-провайдер читает subscription.subscription_token и
+                # subscription.client.telegram_id — без eager-загрузки это
+                # MissingGreenlet, и массовое переключение молча не работает.
+                selectinload(InboundConnection.subscription).selectinload(
+                    Subscription.client
+                ),
             )
         )
         connections = result.scalars().all()
@@ -1800,8 +1805,6 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
                         )
                         # Не затираем pending_push: он помечает неотправленное
                         # изменение и учитывается в счётчике «не применилось».
-                        # Ветка достижима только для AWG/MTProxy — XUI-провайдер
-                        # сообщает об отказе исключением, а не False.
                         if conn.sync_status != "pending_push":
                             conn.sync_status = "error"
                         continue
@@ -2004,16 +2007,15 @@ async def exit_multi_select_mode(callback: CallbackQuery, state: FSMContext) -> 
         )
 
         # Add buttons for each inbound
-        if conn.is_enabled:
-            builder.button(
-                text=f"✅ {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
-        else:
-            builder.button(
-                text=f"🔌 {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
+        # Значок тот же, что в тексте выше: иначе в одной строке два разных
+        # сигнала о состоянии подключения.
+        icon = "⏳" if getattr(conn, "sync_status", None) == "pending_push" else (
+            "✅" if conn.is_enabled else "🔌"
+        )
+        builder.button(
+            text=f"{icon} {inbound.remark} ({inbound.protocol})",
+            callback_data=f"toggle_conn_{conn.id}",
+        )
         builder.button(text="🗑️", callback_data=f"delete_conn_{conn.id}")
         builder.adjust(2)
 

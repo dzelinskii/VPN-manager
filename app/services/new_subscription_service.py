@@ -251,7 +251,10 @@ class NewSubscriptionService:
                         "rebuild_subscription: не удалось обновить inbound {} для sub {}: {}",
                         conn.inbound_id, subscription_id, e,
                     )
-                    conn.sync_status = "error"
+                    # Не понижаем pending_push: под error синхронизация примет
+                    # данные панели и затрёт неотправленное изменение.
+                    if conn.sync_status != "pending_push":
+                        conn.sync_status = "error"
                     failed.append((conn.inbound_id, str(e)))
 
         # Process added — XUI одной панели группируются в одного клиента (attach к
@@ -1537,7 +1540,9 @@ class NewSubscriptionService:
                     "Не удалось сбросить трафик VPN-клиента для connection {}: {}",
                     connection.id, e,
                 )
-                if base_days > 0:
+                # Не понижаем pending_push: под error синхронизация примет
+                # данные панели и затрёт неотправленное изменение.
+                if base_days > 0 and connection.sync_status != "pending_push":
                     connection.sync_status = "error"
 
         if base_days > 0:

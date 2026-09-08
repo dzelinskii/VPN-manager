@@ -5,9 +5,10 @@
 тихим застреванием. Синхронизация теперь догоняет панель до состояния БД —
 так же, как это давно делает `awg_sync`.
 
-Источник истины при досылке — подписка: именно на ней живут срок, лимит и
-признак активности. У подключения `is_enabled` после неудачного пуша отражает
-панель, а не намерение админа.
+В этом статусе строка хранит **желаемое** состояние: `is_enabled` — намерение
+админа, срок и лимит берутся из подписки. Поэтому досылается строка как есть —
+вывести состояние из подписки нельзя, иначе индивидуально выключенное
+подключение мультиинбаундной подписки включится обратно.
 """
 
 import json
@@ -106,6 +107,11 @@ async def _load_inbound(session, inbound_id):
 async def test_pending_push_is_sent_to_panel(test_session, mock_settings, monkeypatch):
     """Успешная досылка снимает признак и подтягивает поля подписки."""
     sub, conn = await _setup(test_session, 998001)
+    # Разводим срок подключения с подписочным, иначе сравнение ниже тривиально.
+    conn.expiry_date = sub.expiry_date - timedelta(days=10)
+    conn.sync_error = "missing_on_panel"
+    await test_session.flush()
+
     provider = AsyncMock()
     provider.update_client = AsyncMock(return_value=True)
     provider.close = AsyncMock()
@@ -120,8 +126,10 @@ async def test_pending_push_is_sent_to_panel(test_session, mock_settings, monkey
 
     provider.update_client.assert_awaited_once()
     assert conn.sync_status == "synced"
-    assert conn.expiry_date == sub.expiry_date
     assert conn.total_gb == sub.total_gb
+    # Поля подтягиваются из подписки — источника истины для срока и лимита.
+    assert conn.expiry_date == sub.expiry_date
+    assert conn.sync_error is None, "протухшая причина пережила успешную досылку"
 
 
 @pytest.mark.asyncio
@@ -343,3 +351,39 @@ async def test_synced_connections_are_not_pushed(test_session, mock_settings, mo
     )
 
     provider.update_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_push_normalizes_naive_expiry(test_session, mock_settings, monkeypatch):
+    """Срок из SQLite приходит naive — без нормализации он уедет на смещение от UTC.
+
+    Провайдер делает `.timestamp()`, а naive-время трактуется как локальное.
+    Регрессия здесь тихая: продление молча теряет часы, а после успешной досылки
+    укороченный срок возвращается в подписку следующим циклом.
+    """
+    sub, conn = await _setup(test_session, 998010)
+    aware_expiry = sub.expiry_date
+
+    # Перечитываем подписку из БД, чтобы получить ровно то, что видит прод.
+    await test_session.refresh(sub)
+    assert sub.expiry_date.tzinfo is None, "фикстура не воспроизводит naive из SQLite"
+
+    seen = {}
+
+    async def _capture(inbound, connection, total_gb, expiry, *args, **kwargs):
+        seen["expiry"] = expiry
+        return True
+
+    provider = AsyncMock()
+    provider.update_client = AsyncMock(side_effect=_capture)
+    monkeypatch.setattr(
+        "app.services.vpn_providers.factory.get_vpn_provider", lambda *a, **k: provider
+    )
+
+    inbound = await _load_inbound(test_session, conn.inbound_id)
+    await XUIProtocolSync().sync_clients(
+        test_session, inbound, xui_service=_panel(conn)
+    )
+
+    assert seen["expiry"].tzinfo is not None, "в провайдер ушёл naive-срок"
+    assert seen["expiry"].timestamp() == pytest.approx(aware_expiry.timestamp(), abs=1)

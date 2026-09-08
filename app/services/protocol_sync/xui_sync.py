@@ -115,6 +115,10 @@ class XUIProtocolSync(ProtocolSyncBase):
                 # нужно наоборот дослать. Именно pending_push, а не error:
                 # error реконсиляция снимает сама, увидев клиента на панели.
                 if conn.sync_status == "pending_push":
+                    # Клиент снова виден на панели — снимаем пометку «уже
+                    # уведомляли», иначе о повторном застревании не сообщим.
+                    if conn.sync_error == _MISSING_ON_PANEL:
+                        conn.sync_error = None
                     if push_provider is None:
                         from app.services.vpn_providers.factory import get_vpn_provider
 
