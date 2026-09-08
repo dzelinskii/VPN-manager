@@ -21,7 +21,7 @@ from app.bot.keyboards import (
 )
 from app.bot.states.admin import SubscriptionManagement, SubscriptionRebuild
 from app.database import async_session_factory
-from app.database.models import Inbound
+from app.database.models import Inbound, Subscription
 from app.services.client_service import ClientService
 from app.services.pricing import (
     format_price,
@@ -637,6 +637,20 @@ async def create_subscription(callback: CallbackQuery, state: FSMContext) -> Non
 # Additional subscription management handlers
 
 
+def _conn_status_icon(conn, disabled_icon: str = "❌") -> str:
+    """Значок состояния подключения.
+
+    В статусе pending_push строка хранит намерение админа, а не то, что на
+    сервере, — иначе интерфейс показывал бы применённым то, чего на панели нет.
+
+    ``disabled_icon`` отличается у текста и кнопок, поэтому вынесен параметром:
+    дублировать выражение нельзя, иначе значки разъедутся.
+    """
+    if getattr(conn, "sync_status", None) == "pending_push":
+        return "⏳"
+    return "✅" if conn.is_enabled else disabled_icon
+
+
 async def _count_pending_push(session, subscription_id: int) -> int:
     """Сколько подключений подписки не доехало до сервера.
 
@@ -928,7 +942,7 @@ async def show_subscription_inbounds(callback: CallbackQuery) -> None:
     builder = InlineKeyboardBuilder()
 
     for conn in connections:
-        status = "✅" if conn.is_enabled else "❌"
+        status = _conn_status_icon(conn)
         inbound = conn.inbound
         server = inbound.server
 
@@ -971,16 +985,13 @@ async def show_subscription_inbounds(callback: CallbackQuery) -> None:
             conn_id=conn.id,
         )
 
-        if conn.is_enabled:
-            builder.button(
-                text=f"✅ {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
-        else:
-            builder.button(
-                text=f"🔌 {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
+        # Тот же значок, что в тексте выше: иначе в одной строке два разных
+        # сигнала о состоянии подключения.
+        icon = _conn_status_icon(conn, disabled_icon="🔌")
+        builder.button(
+            text=f"{icon} {inbound.remark} ({inbound.protocol})",
+            callback_data=f"toggle_conn_{conn.id}",
+        )
         builder.button(text="🗑️", callback_data=f"delete_conn_{conn.id}")
         if conn.type in ("awg_inbound_connection", "mtproxy_inbound_connection"):
             builder.button(
@@ -1484,7 +1495,7 @@ async def toggle_inbound_connection(callback: CallbackQuery) -> None:
             builder = InlineKeyboardBuilder()
 
             for conn in connections:
-                conn_status = "✅" if conn.is_enabled else "❌"
+                conn_status = _conn_status_icon(conn)
                 inbound = conn.inbound
                 server = inbound.server
 
@@ -1748,6 +1759,12 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
                 selectinload(InboundConnection.inbound)
                 .selectinload(Inbound.server)
                 .selectinload(ServerModel.mtproxy_service),
+                # XUI-провайдер читает subscription.subscription_token и
+                # subscription.client.telegram_id — без eager-загрузки это
+                # MissingGreenlet, и массовое переключение молча не работает.
+                selectinload(InboundConnection.subscription).selectinload(
+                    Subscription.client
+                ),
             )
         )
         connections = result.scalars().all()
@@ -1787,7 +1804,10 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
                         logger.warning(
                             "Сервер не подтвердил {} подключения {}", action, conn.id
                         )
-                        conn.sync_status = "error"
+                        # Не затираем pending_push: он помечает неотправленное
+                        # изменение и учитывается в счётчике «не применилось».
+                        if conn.sync_status != "pending_push":
+                            conn.sync_status = "error"
                         continue
 
                     conn.is_enabled = new_state
@@ -1821,7 +1841,7 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
             builder = InlineKeyboardBuilder()
 
             for conn in updated_connections:
-                status = "✅" if conn.is_enabled else "❌"
+                status = _conn_status_icon(conn)
                 inbound = conn.inbound
                 server = inbound.server
 
@@ -1964,7 +1984,7 @@ async def exit_multi_select_mode(callback: CallbackQuery, state: FSMContext) -> 
     builder = InlineKeyboardBuilder()
 
     for conn in connections:
-        status = "✅" if conn.is_enabled else "❌"
+        status = _conn_status_icon(conn)
         inbound = conn.inbound
         server = inbound.server
 
@@ -1988,16 +2008,13 @@ async def exit_multi_select_mode(callback: CallbackQuery, state: FSMContext) -> 
         )
 
         # Add buttons for each inbound
-        if conn.is_enabled:
-            builder.button(
-                text=f"✅ {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
-        else:
-            builder.button(
-                text=f"🔌 {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
+        # Тот же значок, что в тексте выше: иначе в одной строке два разных
+        # сигнала о состоянии подключения.
+        icon = _conn_status_icon(conn, disabled_icon="🔌")
+        builder.button(
+            text=f"{icon} {inbound.remark} ({inbound.protocol})",
+            callback_data=f"toggle_conn_{conn.id}",
+        )
         builder.button(text="🗑️", callback_data=f"delete_conn_{conn.id}")
         builder.adjust(2)
 

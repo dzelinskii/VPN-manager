@@ -113,7 +113,7 @@ async def test_reconciler_does_not_heal_pending_push(test_session, mock_settings
 
 
 @pytest.mark.asyncio
-async def test_xui_sync_respects_pending_push(test_session, mock_settings):
+async def test_xui_sync_respects_pending_push(test_session, mock_settings, monkeypatch):
     """Синхронизация не принимает данные панели для непрошедшего изменения."""
     import json
     from types import SimpleNamespace
@@ -128,6 +128,15 @@ async def test_xui_sync_respects_pending_push(test_session, mock_settings):
     conn.expiry_date = local_expiry
     conn.sync_status = PENDING_PUSH
     await test_session.flush()
+
+    # Панель отказывает: досылка не проходит, значит защита обязана удержать
+    # локальный срок, а не откатить его к панельному.
+    push_provider = AsyncMock()
+    push_provider.update_client = AsyncMock(return_value=False)
+    push_provider.close = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.vpn_providers.factory.get_vpn_provider", lambda *a, **k: push_provider
+    )
 
     panel_ms = int((datetime.now(UTC) + timedelta(days=3)).timestamp() * 1000)
     xui_client = AsyncMock()
@@ -184,7 +193,9 @@ async def test_failed_status_change_marks_pending_push(
     await NewSubscriptionService(test_session).update_subscription(sub.id, is_active=False)
 
     assert conn.sync_status == PENDING_PUSH
-    assert conn.is_enabled is True, "флаг не должен переворачиваться без панели"
+    # Строка в pending_push хранит намерение админа, а не состояние панели:
+    # именно его досылает синхронизация. Что оно ещё не применено, говорит статус.
+    assert conn.is_enabled is False, "намерение должно сохраниться для досылки"
 
 
 # --- C3: жёсткий отказ вместо тихого частичного успеха ---------------------

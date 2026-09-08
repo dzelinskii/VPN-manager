@@ -10,7 +10,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload, with_polymorphic
 
 from app.services.protocol_sync import ProtocolSyncBase, register
+from app.utils.date_utils import ensure_utc
 from app.xui_client.models import ensure_settings_dict
+
+# Причина в sync_error, она же признак «об этом уже уведомляли».
+_MISSING_ON_PANEL = "missing_on_panel"
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -94,6 +98,9 @@ class XUIProtocolSync(ProtocolSyncBase):
         )
 
         synced_count = 0
+        # Провайдер для досылки создаём лениво и один на весь inbound: он держит
+        # aiohttp-сессию к панели, а подключений в очереди может быть много.
+        push_provider = None
         for xui_client_data in xui_clients:
             xui_uuid = xui_client_data.get("id", "")
             if not xui_uuid:
@@ -103,16 +110,28 @@ class XUIProtocolSync(ProtocolSyncBase):
             if xui_uuid in existing_map:
                 conn = existing_map[xui_uuid]
 
-                # Локальное изменение ещё не доехало до панели: принять её данные
-                # значило бы молча потерять продление или смену статуса.
-                # Именно pending_push, а не error: error реконсиляция снимает
-                # сама, увидев клиента на панели, и защита жила бы один цикл.
+                # Локальное изменение ещё не доехало до панели: данные панели
+                # принимать нельзя (потеряем продление или смену статуса), их
+                # нужно наоборот дослать. Именно pending_push, а не error:
+                # error реконсиляция снимает сама, увидев клиента на панели.
                 if conn.sync_status == "pending_push":
-                    logger.warning(
-                        "Подключение {} ждёт отправки на сервер — не принимаем данные "
-                        "панели, чтобы не потерять непрошедшее изменение",
-                        conn.id,
-                    )
+                    # Клиент снова виден на панели — снимаем пометку «уже
+                    # уведомляли», иначе о повторном застревании не сообщим.
+                    if conn.sync_error == _MISSING_ON_PANEL:
+                        conn.sync_error = None
+                    if push_provider is None:
+                        from app.services.vpn_providers.factory import get_vpn_provider
+
+                        push_provider = get_vpn_provider(
+                            inbound.server, inbound_type="xui_inbound"
+                        )
+                        # Переиспользуем уже аутентифицированного клиента: иначе
+                        # провайдер логинится в панель заново на каждый inbound.
+                        # Клиент принадлежит XUIService — закрывать его здесь
+                        # нельзя, он живёт в кэше сервиса.
+                        push_provider._client = xui_client
+                    if await self._push_pending(inbound, conn, push_provider):
+                        synced_count += 1
                     continue
 
                 xui_enable = xui_client_data.get("enable", True)
@@ -180,9 +199,109 @@ class XUIProtocolSync(ProtocolSyncBase):
                     xui_uuid,
                 )
 
+        # Подключение, ждущее отправки, но отсутствующее на панели, дослать
+        # нечем: update_client правит существующего клиента. Реконсиляция его
+        # тоже не увидит — она выбирает по статусу "error".
+        #
+        # Пустой снимок не отличить от мягкого сбоя панели (так же осторожничает
+        # реконсиляция), поэтому по нему выводов не делаем.
+        if xui_clients:
+            panel_uuids = {c.get("id") for c in xui_clients if c.get("id")}
+            orphaned = [
+                conn
+                for conn in existing_connections
+                if conn.sync_status == "pending_push"
+                and getattr(conn, "uuid", None) not in panel_uuids
+            ]
+            # Уведомляем один раз на переход: состояние само не рассасывается, а
+            # цикл идёт каждые несколько минут — иначе админ получал бы сотни
+            # сообщений в сутки, и настоящие оповещения утонули бы.
+            fresh = [c for c in orphaned if c.sync_error != _MISSING_ON_PANEL]
+            for conn in orphaned:
+                logger.warning(
+                    "Подключение {} ждёт отправки, но отсутствует на панели inbound {} — "
+                    "досылка невозможна",
+                    conn.id, inbound.id,
+                )
+                conn.sync_error = _MISSING_ON_PANEL
+            if fresh:
+                await self._notify_stuck(session, inbound, fresh)
+
         await session.flush()
         logger.info("Синхронизировано {} клиентов для inbound {}", synced_count, inbound.id)
         return synced_count
+
+    async def _notify_stuck(self, session, inbound: "Inbound", orphaned: list) -> None:
+        """Сообщить админам о застрявших подключениях.
+
+        Подключение, ждущее отправки и отсутствующее на панели, дослать нечем:
+        ``update_client`` правит существующего клиента. Реконсиляция его тоже не
+        подхватит — она выбирает записи по статусу ``error``. Без уведомления
+        такое застревало бы навсегда, а за подписку могли уже заплатить.
+        """
+        from app.services.notification_service import NotificationService
+
+        marked = [
+            {
+                "email": getattr(conn, "email", None) or f"connection {conn.id}",
+                "user": conn.subscription.client.name
+                if conn.subscription and conn.subscription.client
+                else "—",
+            }
+            for conn in orphaned
+        ]
+        try:
+            await NotificationService(session).notify_admins_stuck_pending_push(
+                server_name=inbound.server.name,
+                stuck_connections=marked,
+            )
+        except Exception as e:
+            logger.error("Не удалось уведомить о застрявших подключениях: {}", e)
+
+    async def _push_pending(self, inbound: "Inbound", conn, provider) -> bool:
+        """Дослать на панель локальное состояние подключения.
+
+        В статусе ``pending_push`` строка хранит **желаемое** состояние, а не
+        то, что на сервере: ``is_enabled`` — намерение админа, срок и лимит
+        берутся из подписки. Поэтому досылается строка как есть — угадывать
+        намерение из подписки нельзя, иначе индивидуально выключённое
+        подключение мультиинбаундной подписки будет включено обратно.
+
+        Признак снимается только после подтверждения панелью; иначе следующий
+        цикл повторит попытку.
+        """
+        sub = conn.subscription
+        if sub is None:
+            logger.warning("Подключение {} без подписки — досылать нечего", conn.id)
+            return False
+
+        # SQLite отдаёт naive-время, а провайдер делает .timestamp(): без
+        # нормализации срок уезжает на локальное смещение от UTC.
+        expiry = ensure_utc(sub.expiry_date)
+
+        try:
+            applied = await provider.update_client(inbound, conn, sub.total_gb, expiry)
+        except Exception as e:
+            logger.warning(
+                "Не удалось дослать подключение {} на панель: {} (повтор в следующем цикле)",
+                conn.id, e,
+            )
+            return False
+
+        if not applied:
+            logger.warning(
+                "Панель не подтвердила досылку подключения {} (повтор в следующем цикле)",
+                conn.id,
+            )
+            return False
+
+        conn.total_gb = sub.total_gb
+        conn.expiry_date = expiry
+        conn.sync_status = "synced"
+        conn.sync_error = None
+        conn.last_sync_at = datetime.now(UTC)
+        logger.info("Подключение {} дослано на панель", conn.id)
+        return True
 
     async def verify_connection(
         self,
