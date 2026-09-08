@@ -110,7 +110,11 @@ async def test_divergence_restore_keeps_pending_push(test_session, mock_settings
     их применёнными — но соседняя строка может ждать отправки своего изменения.
     """
     from app.database.models import PendingDivergence
-    from app.services.divergence_service import DivergenceService
+    from app.services.divergence_service import (
+        KIND_MISSING,
+        STATUS_OPEN,
+        DivergenceService,
+    )
 
     sub, conn = await _setup(test_session, 999002)
     inbound_row = await _load_inbound(test_session, conn.inbound_id)
@@ -137,8 +141,8 @@ async def test_divergence_restore_keeps_pending_push(test_session, mock_settings
         server_id=inbound_row.server_id,
         subscription_id=sub.id,
         email=conn.email,
-        kind="missing",
-        status="pending",
+        kind=KIND_MISSING,
+        status=STATUS_OPEN,
         details_json={"uuid": conn.uuid, "enable": True, "total_gb": 10},
     )
     test_session.add(pd)
@@ -231,7 +235,12 @@ async def test_traffic_change_keeps_connection_disabled(
 async def test_traffic_change_does_not_toggle_awg(
     test_session, mock_settings, monkeypatch
 ):
-    """То же для AWG: правка трафика не должна дёргать enable/disable."""
+    """То же для AWG: правка трафика не должна дёргать enable/disable.
+
+    Гарантия здесь только на уровне этой операции: `awg_sync` каждый цикл
+    выводит желаемое состояние заново из подписки и включит подключение
+    обратно. Для XUI, где такого пересчёта нет, свойство долговечно.
+    """
     sub, conn = await _setup(
         test_session, 999006, xui=False, conn_enabled=False, status="synced"
     )

@@ -637,15 +637,18 @@ async def create_subscription(callback: CallbackQuery, state: FSMContext) -> Non
 # Additional subscription management handlers
 
 
-def _conn_status_icon(conn) -> str:
+def _conn_status_icon(conn, disabled_icon: str = "❌") -> str:
     """Значок состояния подключения.
 
     В статусе pending_push строка хранит намерение админа, а не то, что на
     сервере, — иначе интерфейс показывал бы применённым то, чего на панели нет.
+
+    ``disabled_icon`` отличается у текста и кнопок, поэтому вынесен параметром:
+    дублировать выражение нельзя, иначе значки разъедутся.
     """
     if getattr(conn, "sync_status", None) == "pending_push":
         return "⏳"
-    return "✅" if conn.is_enabled else "❌"
+    return "✅" if conn.is_enabled else disabled_icon
 
 
 async def _count_pending_push(session, subscription_id: int) -> int:
@@ -982,11 +985,9 @@ async def show_subscription_inbounds(callback: CallbackQuery) -> None:
             conn_id=conn.id,
         )
 
-        # Значок тот же, что в тексте выше: иначе в одной строке два разных
+        # Тот же значок, что в тексте выше: иначе в одной строке два разных
         # сигнала о состоянии подключения.
-        icon = "⏳" if getattr(conn, "sync_status", None) == "pending_push" else (
-            "✅" if conn.is_enabled else "🔌"
-        )
+        icon = _conn_status_icon(conn, disabled_icon="🔌")
         builder.button(
             text=f"{icon} {inbound.remark} ({inbound.protocol})",
             callback_data=f"toggle_conn_{conn.id}",
@@ -2007,11 +2008,9 @@ async def exit_multi_select_mode(callback: CallbackQuery, state: FSMContext) -> 
         )
 
         # Add buttons for each inbound
-        # Значок тот же, что в тексте выше: иначе в одной строке два разных
+        # Тот же значок, что в тексте выше: иначе в одной строке два разных
         # сигнала о состоянии подключения.
-        icon = "⏳" if getattr(conn, "sync_status", None) == "pending_push" else (
-            "✅" if conn.is_enabled else "🔌"
-        )
+        icon = _conn_status_icon(conn, disabled_icon="🔌")
         builder.button(
             text=f"{icon} {inbound.remark} ({inbound.protocol})",
             callback_data=f"toggle_conn_{conn.id}",
