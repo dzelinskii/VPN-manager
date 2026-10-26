@@ -498,15 +498,14 @@ async def awg_obf_quick(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(AWGInstall.waiting_for_obfuscation_mode, F.data == "awg_obf_advanced")
 async def awg_obf_advanced(callback: CallbackQuery, state: FSMContext) -> None:
-    """Advanced mode: ask admin for obfuscation parameters."""
+    """Advanced mode: AWG 3.1 — администратор задаёт только Jc, остальное фикс."""
     await state.set_state(AWGInstall.waiting_for_obfuscation_params)
 
     await callback.message.edit_text(
-        "🔧 <b>Advanced: параметры обфускации</b>\n\n"
-        "Введите параметры в формате:\n"
-        "<code>Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4</code>\n\n"
-        "11 чисел через пробел.\n"
-        "Пример: <code>5 100 800 50 50 50 50 1234567890 9876543210 5555555555 1111111111</code>",
+        "🔧 <b>Advanced: параметр Jc (количество джанк-пакетов)</b>\n\n"
+        "В формате 3.1 остальные параметры фиксированы:\n"
+        "Jmin=10, Jmax=50, S1-S4=12, H1-H4=1..4, RandomTrailers=on, DisableCookies=on.\n\n"
+        "Введите одно число Jc (рекомендуется 4-6, допустимо 3-10):",
         reply_markup=get_back_keyboard("cancel"),
         parse_mode="HTML",
     )
@@ -515,27 +514,28 @@ async def awg_obf_advanced(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AWGInstall.waiting_for_obfuscation_params)
 async def awg_obf_params_input(message: TgMessage, state: FSMContext) -> None:
-    """Parse manually entered obfuscation parameters."""
-    parts = message.text.strip().split()
+    """Parse manually entered Jc and build the fixed 3.1 parameter set."""
+    from app.services.installers.awg_installer import generate_obfuscation_params
 
-    if len(parts) != 11:
+    text = message.text.strip()
+
+    if not text.isdigit():
         await message.answer(
-            f"❌ Нужно ровно 11 чисел, получено {len(parts)}. Попробуйте снова.",
+            "❌ Нужно одно число (например, 5). Попробуйте снова.",
             reply_markup=get_back_keyboard("cancel"),
         )
         return
 
-    try:
-        values = [int(p) for p in parts]
-    except ValueError:
+    jc = int(text)
+    if not 3 <= jc <= 10:
         await message.answer(
-            "❌ Все значения должны быть числами.",
+            "❌ Jc должен быть от 3 до 10. Попробуйте снова.",
             reply_markup=get_back_keyboard("cancel"),
         )
         return
 
-    keys = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"]
-    obf = dict(zip(keys, values, strict=True))
+    obf = generate_obfuscation_params()
+    obf["Jc"] = str(jc)
     await state.update_data(obfuscation=obf)
     await _show_awg_confirm(message, state)
 

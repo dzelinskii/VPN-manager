@@ -6,6 +6,10 @@ full_instruction: |
   • <a href="https://play.google.com/store/apps/details?id=org.amnezia.vpn">Android</a>
   • <a href="https://github.com/amnezia-vpn/amnezia-client/releases/latest">Windows, macOS, linux</a>
 
+  ⚠️ Часть серверов работает на новом AmneziaWG 3.1 — для них нужно приложение
+  AmneziaVPN версии 5.0.1.5 или новее. Если конфиг не подключается — обновите
+  приложение до последней версии.
+
   2. Перейдите в раздел "Мои подписки" в боте.
   3. Выберите подписку AmneziaWG.
   4.1 Для мобильных устройств нажимайте - 🔗AmneziaWG, бот пришлет вам ссылку, просто нажмите на неё и она скопируется.

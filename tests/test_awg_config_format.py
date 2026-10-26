@@ -25,6 +25,28 @@ OBFUSCATION = {
     "H3": "3000001-4000000", "H4": "4000001-5000000",
 }
 
+# Сервер, установленный в формате 3.1: S1-S4/H1-H4 фиксированы, есть HP-ключ.
+OBFUSCATION_V3 = {
+    "Jc": "5", "Jmin": "10", "Jmax": "50",
+    "S1": "12", "S2": "12", "S3": "12", "S4": "12",
+    "H1": "1", "H2": "2", "H3": "3", "H4": "4",
+    "RandomTrailers": "on", "DisableCookies": "on",
+    "HeaderProtectionKey": "hEaDeRpRoTeCtIoNkEy1234567890abcdefghijklmnop=",
+}
+
+# Новые клиентские поля 3.1 (формат template.conf из amnezia-client).
+V3_CLIENT_FIELDS = {
+    "HeaderProtectionKey": OBFUSCATION_V3["HeaderProtectionKey"],
+    "ContentPaddingAddition": "10-100",
+    "RekeyAfterTime": "100-120",
+    "RekeyTimeout": "3-7",
+    "RejectAfterTime": "150-180",
+    "KeepaliveTimeout": "5-15",
+    "MaxHandshakeAttempts": "15-20",
+    "RandomTrailers": "on",
+    "DisableCookies": "on",
+}
+
 
 def _make_settings_mock():
     settings = MagicMock()
@@ -40,12 +62,12 @@ def _decode_vpn_uri(uri: str) -> dict:
     return json.loads(zlib.decompress(raw[4:]).decode("utf-8"))
 
 
-def _build_provider():
+def _build_provider(obfuscation: dict | None = None):
     from app.services.vpn_providers.amnezia_awg import AmneziaAWGProvider
 
     awg = MagicMock()
     awg.port = 51820
-    awg.obfuscation = dict(OBFUSCATION)
+    awg.obfuscation = dict(obfuscation if obfuscation is not None else OBFUSCATION)
     awg.subnet_ip = "10.8.0.0"
     awg.subnet_cidr = 24
     awg.server_public_key = "sErVeRpUbLiCkEy1234567890abcdefghijklmn="
@@ -139,3 +161,65 @@ async def test_obfuscation_params_present_as_strings():
     for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
         assert isinstance(last_config[key], str)
         assert last_config[key] == OBFUSCATION[key]
+
+
+def test_generate_obfuscation_params_v3_defaults():
+    """3.1: S1-S4=12 (требование HeaderProtectionKey), H1-H4=1..4, тумблеры on."""
+    from app.services.installers.awg_installer import generate_obfuscation_params
+
+    obf = generate_obfuscation_params()
+
+    assert obf["S1"] == obf["S2"] == obf["S3"] == obf["S4"] == "12"
+    assert [obf["H1"], obf["H2"], obf["H3"], obf["H4"]] == ["1", "2", "3", "4"]
+    assert obf["RandomTrailers"] == "on"
+    assert obf["DisableCookies"] == "on"
+    assert obf["Jmin"] == "10"
+    assert obf["Jmax"] == "50"
+    assert 4 <= int(obf["Jc"]) <= 6
+    # HP-ключ генерируется на сервере при установке, в шаблоне его нет.
+    assert "HeaderProtectionKey" not in obf
+
+
+@pytest.mark.asyncio
+async def test_v3_config_contains_31_fields():
+    """Для сервера 3.1 клиентский конфиг обязан нести HP-ключ и новые поля."""
+    with patch("app.config.get_settings", return_value=_make_settings_mock()), \
+         patch("app.database._get_engine", return_value=MagicMock()), \
+         patch("app.database._get_session_factory", return_value=MagicMock()):
+        provider, inbound, connection = _build_provider(obfuscation=OBFUSCATION_V3)
+        config = await provider.get_client_config(inbound, connection)
+
+    for key, val in V3_CLIENT_FIELDS.items():
+        line = f"{key} = {val}"
+        assert line in config["config_data"], f"в .conf нет строки '{line}'"
+
+    last_config = json.loads(
+        _decode_vpn_uri(config["vpn_uri"])["containers"][0]["awg"]["last_config"]
+    )
+    for key, val in V3_CLIENT_FIELDS.items():
+        assert isinstance(last_config.get(key), str), f"{key} должен быть строкой в last_config"
+        assert last_config[key] == val
+
+    # 2.x-поля при этом остаются (клиент 3.1 читает и их).
+    for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1"):
+        assert isinstance(last_config[key], str)
+
+
+@pytest.mark.asyncio
+async def test_legacy_config_has_no_v3_fields():
+    """Сервер 2.x (без HeaderProtectionKey) — новые поля в конфиг не попадают."""
+    with patch("app.config.get_settings", return_value=_make_settings_mock()), \
+         patch("app.database._get_engine", return_value=MagicMock()), \
+         patch("app.database._get_session_factory", return_value=MagicMock()):
+        provider, inbound, connection = _build_provider(obfuscation=dict(OBFUSCATION))
+        config = await provider.get_client_config(inbound, connection)
+
+    assert "HeaderProtectionKey" not in config["config_data"]
+    assert "ContentPaddingAddition" not in config["config_data"]
+    assert "RandomTrailers" not in config["config_data"]
+
+    last_config = json.loads(
+        _decode_vpn_uri(config["vpn_uri"])["containers"][0]["awg"]["last_config"]
+    )
+    for key in V3_CLIENT_FIELDS:
+        assert key not in last_config, f"{key} не должен попадать в конфиг сервера 2.x"
