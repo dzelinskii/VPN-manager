@@ -251,7 +251,10 @@ class NewSubscriptionService:
                         "rebuild_subscription: не удалось обновить inbound {} для sub {}: {}",
                         conn.inbound_id, subscription_id, e,
                     )
-                    conn.sync_status = "error"
+                    # Не понижаем pending_push: под error синхронизация примет
+                    # данные панели и затрёт неотправленное изменение.
+                    if conn.sync_status != "pending_push":
+                        conn.sync_status = "error"
                     failed.append((conn.inbound_id, str(e)))
 
         # Process added — XUI одной панели группируются в одного клиента (attach к
@@ -813,14 +816,31 @@ class NewSubscriptionService:
 
         if inbound.type in ("awg_inbound", "mtproxy_inbound"):
             if enable:
-                await provider.enable_client(inbound, connection)
+                applied = await provider.enable_client(inbound, connection)
             else:
-                await provider.disable_client(inbound, connection)
+                applied = await provider.disable_client(inbound, connection)
+            if not applied:
+                # Флаг в БД не трогаем: иначе бот считает клиента отключённым,
+                # а на сервере он продолжает работать.
+                logger.warning(
+                    "Сервер не подтвердил смену статуса connection {} — статус не изменён",
+                    connection.id,
+                )
+                connection.sync_status = "error"
+                await self.session.flush()
+                return connection
         else:
+            previous_enabled = connection.is_enabled
             connection.is_enabled = enable
-            await provider.update_client(
-                inbound, connection, connection.total_gb, connection.expiry_date
-            )
+            try:
+                await provider.update_client(
+                    inbound, connection, connection.total_gb, connection.expiry_date
+                )
+            except Exception:
+                # Отказ жёсткий: иначе хэндлер отрапортует «включено» в ответ на
+                # неудавшуюся попытку отключить.
+                connection.is_enabled = previous_enabled
+                raise
 
         connection.is_enabled = enable
         await self.session.flush()
@@ -871,13 +891,31 @@ class NewSubscriptionService:
 
                 if inbound.type in ("awg_inbound", "mtproxy_inbound"):
                     if enable:
-                        await provider.enable_client(inbound, connection)
+                        applied = await provider.enable_client(inbound, connection)
                     else:
-                        await provider.disable_client(inbound, connection)
+                        applied = await provider.disable_client(inbound, connection)
+                    if not applied:
+                        logger.warning(
+                            "Сервер не подтвердил смену статуса connection {} — статус не изменён",
+                            connection.id,
+                        )
+                        connection.sync_status = "error"
+                        continue
                 else:
-                    await provider.update_client(
-                        inbound, connection, connection.total_gb, connection.expiry_date
-                    )
+                    # Новый флаг выставляем до вызова: XUI-провайдер читает его
+                    # из объекта. При отказе панели возвращаем прежний.
+                    previous_enabled = connection.is_enabled
+                    connection.is_enabled = enable
+                    try:
+                        await provider.update_client(
+                            inbound, connection, connection.total_gb, connection.expiry_date
+                        )
+                    except Exception:
+                        # Отказ жёсткий: вызывающий откатывает транзакцию целиком.
+                        # Проглатывать нельзя — получится наполовину отключённый
+                        # клиент с рапортом об успехе.
+                        connection.is_enabled = previous_enabled
+                        raise
 
                 connection.is_enabled = enable
                 toggled_count += 1
@@ -1225,11 +1263,13 @@ class NewSubscriptionService:
 
         await self.session.flush()
 
-        # Update XUI clients if traffic/expiry parameters changed
+        # Смена статуса тоже требует похода на сервер: без этого подписка
+        # числится отключённой в БД, а VPN продолжает работать.
         if (
             total_gb is not None
             or expiry_days is not None
             or exact_expiry_date is not None
+            or is_active is not None
         ):
             result = await self.session.execute(
                 select(InboundConnection)
@@ -1253,13 +1293,49 @@ class NewSubscriptionService:
                 try:
                     provider = await self._get_provider(connection.inbound.server, inbound=connection.inbound)
 
-                    connection.is_enabled = subscription.is_active
-                    await provider.update_client(
-                        connection.inbound,
-                        connection,
-                        subscription.total_gb,
-                        subscription.expiry_date,
-                    )
+                    # У AWG/MTProxy update_client — заглушка, статусом управляют
+                    # отдельные enable_client/disable_client. У XUI флаг enable
+                    # едет внутри update_client.
+                    if connection.inbound.type in ("awg_inbound", "mtproxy_inbound"):
+                        # Статус трогаем только когда его и правда меняли:
+                        # правка трафика или срока не должна включать обратно
+                        # индивидуально выключенное подключение.
+                        if is_active is not None:
+                            if subscription.is_active:
+                                applied = await provider.enable_client(
+                                    connection.inbound, connection
+                                )
+                            else:
+                                applied = await provider.disable_client(
+                                    connection.inbound, connection
+                                )
+                            if not applied:
+                                logger.warning(
+                                    "Сервер не подтвердил смену статуса connection {} — "
+                                    "оставляю прежний статус",
+                                    connection.id,
+                                )
+                                connection.sync_status = "error"
+                                continue
+                            connection.is_enabled = subscription.is_active
+                    else:
+                        # Флаг трогаем только когда статус подписки и правда
+                        # меняли: подключение можно выключить индивидуально, и
+                        # правка трафика или срока не должна его воскрешать —
+                        # тем более что досылка отправит строку на панель как есть.
+                        #
+                        # При смене статуса флаг остаётся намерением админа даже
+                        # при отказе панели: строка в pending_push хранит
+                        # желаемое состояние, откатывать нельзя — иначе
+                        # намерение потеряется и досылать будет нечего.
+                        if is_active is not None:
+                            connection.is_enabled = subscription.is_active
+                        await provider.update_client(
+                            connection.inbound,
+                            connection,
+                            subscription.total_gb,
+                            subscription.expiry_date,
+                        )
 
                     # Update per-connection settings
                     connection.total_gb = subscription.total_gb
@@ -1271,7 +1347,10 @@ class NewSubscriptionService:
                         "Не удалось обновить VPN-клиент для connection {}: {}",
                         connection.id, e,
                     )
-                    connection.sync_status = "error"
+                    # Намерение админа (is_active) остаётся в БД, но на сервер не
+                    # доехало: помечаем, чтобы синхронизация это не затёрла и
+                    # чтобы хэндлер мог сказать правду вместо «✅ отключено».
+                    connection.sync_status = "pending_push"
 
             await self.session.flush()
 
@@ -1342,15 +1421,30 @@ class NewSubscriptionService:
                 connection.sync_status = "synced"
                 connection.last_sync_at = now
 
-                if connection.inbound.type in ("awg_inbound", "mtproxy_inbound") and not connection.is_enabled and subscription.is_active:
-                    await provider.enable_client(connection.inbound, connection)
-                    connection.is_enabled = True
+                if (
+                    connection.inbound.type in ("awg_inbound", "mtproxy_inbound")
+                    and not connection.is_enabled
+                    and subscription.is_active
+                ):
+                    if await provider.enable_client(connection.inbound, connection):
+                        connection.is_enabled = True
+                    else:
+                        # Продление без реального включения — худший случай для
+                        # оплаты: деньги приняты, доступа нет, и бот это скрывает.
+                        logger.warning(
+                            "Сервер не подтвердил включение connection {} после продления",
+                            connection.id,
+                        )
+                        connection.sync_status = "pending_push"
             except Exception as e:
                 logger.warning(
                     "Не удалось обновить VPN-клиент для connection {}: {}",
                     connection.id, e,
                 )
-                connection.sync_status = "error"
+                # Новый срок уже в БД, но на сервере его нет — помечаем именно
+                # pending_push, иначе реконсиляция вылечит статус и следующий
+                # цикл откатит срок по данным панели.
+                connection.sync_status = "pending_push"
 
         await self.session.flush()
         updated = await self.get_subscription(subscription_id)
@@ -1446,7 +1540,9 @@ class NewSubscriptionService:
                     "Не удалось сбросить трафик VPN-клиента для connection {}: {}",
                     connection.id, e,
                 )
-                if base_days > 0:
+                # Не понижаем pending_push: под error синхронизация примет
+                # данные панели и затрёт неотправленное изменение.
+                if base_days > 0 and connection.sync_status != "pending_push":
                     connection.sync_status = "error"
 
         if base_days > 0:

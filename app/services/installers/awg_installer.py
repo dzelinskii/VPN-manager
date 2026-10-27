@@ -1,15 +1,19 @@
-"""AmneziaWG installer following original AmneziaVPN logic.
+"""AmneziaWG installer following original AmneziaVPN logic (AWG 3.1 format).
 
 Reference: amnezia-client/client/server_scripts/awg/
 
 Flow:
 1. prepare_host() — Docker, utils, UFW (via BaseInstaller)
-2. generate_obfuscation_params() — random or admin-defined Jc/Jmin/Jmax/S1-S4/H1-H4
+2. generate_obfuscation_params() — 3.1 defaults: Jc random 4-6, Jmin=10, Jmax=50,
+   S1-S4=12 (HeaderProtectionKey требует S1-S4 >= 12), H1-H4=1..4,
+   RandomTrailers=on, DisableCookies=on
 3. install(port, subnet_cidr, obfuscation_params) — full installation
 4. Saves config to /opt/vpnbot/awg/ on the server
 
 Container name: vpnbot-awg
 Config dir on server: /opt/vpnbot/awg/
+
+Клиентские конфиги для таких серверов требуют приложение AmneziaVPN >= 5.0.1.5.
 """
 
 import contextlib
@@ -32,33 +36,30 @@ I1_DEFAULT = "<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c
 
 
 def generate_obfuscation_params() -> dict[str, str]:
-    """Generate AWG v2 obfuscation parameters matching original AmneziaVPN.
+    """Generate AWG 3.1 obfuscation parameters matching original AmneziaVPN.
 
-    H1-H4: non-overlapping ascending ranges in [5, 2^31-1].
+    S1-S4: fixed 12 (HeaderProtectionKey требует S1-S4 >= 12).
+    H1-H4: фиксированные 1..4 — случайные диапазоны в 3.x больше не нужны.
+    RandomTrailers/DisableCookies: новые тумблеры 3.1, всегда on.
     I1: DNS A response for icloud.com (default anti-DPI junk).
     I2-I5: empty (reserved for future use).
+    HeaderProtectionKey генерируется отдельно на сервере (awg genkey)
+    в _generate_keys_and_config и добавляется в obfuscation при установке.
     """
-    max_val = (2**31) - 1
-    headers = []
-    lo = 5
-    for _ in range(4):
-        first = random.randint(lo, max_val)
-        second = random.randint(first, max_val)
-        headers.append(f"{first}-{second}")
-        lo = second + 1
-
     return {
-        "Jc": str(random.randint(3, 10)),
-        "Jmin": str(random.randint(10, 50)),
-        "Jmax": str(random.randint(50, 100)),
-        "S1": str(random.randint(15, 100)),
-        "S2": str(random.randint(15, 100)),
-        "S3": str(random.randint(15, 100)),
-        "S4": str(random.randint(15, 100)),
-        "H1": headers[0],
-        "H2": headers[1],
-        "H3": headers[2],
-        "H4": headers[3],
+        "Jc": str(random.randint(4, 6)),
+        "Jmin": "10",
+        "Jmax": "50",
+        "S1": "12",
+        "S2": "12",
+        "S3": "12",
+        "S4": "12",
+        "H1": "1",
+        "H2": "2",
+        "H3": "3",
+        "H4": "4",
+        "RandomTrailers": "on",
+        "DisableCookies": "on",
         "I1": I1_DEFAULT,
         "I2": "",
         "I3": "",
@@ -88,13 +89,17 @@ class AWGInstaller(BaseInstaller):
             pk_match = re.search(r"PrivateKey\s*=\s*(\S+)", config)
 
             obfuscation = {}
-            for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"):
+            for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4",
+                        "RandomTrailers", "DisableCookies"):
                 m = re.search(rf"{key}\s*=\s*(.+)", config)
                 if m:
                     obfuscation[key] = m.group(1).strip()
             for key in ("I1", "I2", "I3", "I4", "I5"):
                 m = re.search(rf"{key}\s*=\s*(.*)", config)
                 obfuscation[key] = m.group(1).strip() if m else ""
+            m = re.search(r"HeaderProtectionKey\s*=\s*(\S+)", config)
+            if m:
+                obfuscation["HeaderProtectionKey"] = m.group(1).strip()
 
             public_key = ""
             with contextlib.suppress(Exception):
@@ -194,6 +199,10 @@ class AWGInstaller(BaseInstaller):
                 keys = await self._generate_keys_and_config(
                     port, subnet_ip, subnet_cidr, obfuscation
                 )
+                obfuscation = {
+                    **obfuscation,
+                    "HeaderProtectionKey": keys["header_protection_key"],
+                }
 
                 await self._progress(10, 11, "Перезапуск с конфигурацией...")
                 await self._restart_container()
@@ -211,6 +220,7 @@ class AWGInstaller(BaseInstaller):
                     "service_dir": service_dir,
                     "server_private_key": keys["server_private_key"],
                     "server_public_key": keys["server_public_key"],
+                    "header_protection_key": keys["header_protection_key"],
                 }
         except Exception:
             logger.exception("AWG installation failed, running cleanup")
@@ -311,11 +321,15 @@ tail -f /dev/null
         psk = await self._cmd(
             f"docker exec -i {name} awg genpsk"
         )
+        header_protection_key = await self._cmd(
+            f"docker exec -i {name} awg genkey"
+        )
 
         key_files = {
             "wireguard_server_private_key.key": private_key,
             "wireguard_server_public_key.key": public_key,
             "wireguard_psk.key": psk,
+            "header_protection_key.key": header_protection_key,
         }
         for filename, content in key_files.items():
             await self._cmd(
@@ -326,6 +340,9 @@ tail -f /dev/null
         obf_keys = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"]
         obf_lines = "\n".join(f"{k} = {obfuscation[k]}" for k in obf_keys if obfuscation.get(k))
 
+        v3_keys = ["RandomTrailers", "DisableCookies"]
+        obf_lines += "\n" + "\n".join(f"{k} = {obfuscation[k]}" for k in v3_keys if obfuscation.get(k))
+
         i_keys = ["I1", "I2", "I3", "I4", "I5"]
         i_lines = "\n".join(f"# {k} = {obfuscation.get(k, '')}" for k in i_keys)
 
@@ -334,6 +351,7 @@ tail -f /dev/null
             f"PrivateKey = {private_key}\n"
             f"Address = {subnet_ip}/{subnet_cidr}\n"
             f"ListenPort = {port}\n"
+            f"HeaderProtectionKey = {header_protection_key}\n"
             f"{obf_lines}\n"
             f"{i_lines}\n"
         )
@@ -346,6 +364,7 @@ tail -f /dev/null
         return {
             "server_private_key": private_key,
             "server_public_key": public_key,
+            "header_protection_key": header_protection_key,
         }
 
     async def _restart_container(self) -> None:

@@ -864,6 +864,65 @@ class NotificationService:
                 exc_info=True,
             )
 
+    async def notify_admins_stuck_pending_push(
+        self,
+        server_name: str,
+        stuck_connections: list[dict],
+    ) -> None:
+        """Уведомить администраторов о неотправленных изменениях без клиента на панели.
+
+        Отличается от :meth:`notify_admins_missing_on_panel` тем, что здесь
+        автоматической очистки не будет: изменение записано в БД, а применить
+        его некуда — клиента на панели нет. Нужны руки.
+
+        Args:
+            server_name: Имя сервера.
+            stuck_connections: Список словарей с ключами 'email' и 'user'.
+        """
+        settings = get_settings()
+        admin_ids = settings.admin_ids
+        if not admin_ids:
+            logger.warning("Нет admin_ids — пропуск уведомления о застрявших изменениях")
+            return
+
+        if not stuck_connections:
+            return
+
+        lines = []
+        for entry in stuck_connections:
+            email = html.escape(entry.get("email") or "—")
+            user = html.escape(entry.get("user") or "—")
+            lines.append(f"• <code>{email}</code> (пользователь: {user})")
+
+        message = (
+            f"⚠️ <b>Изменения не удалось применить</b>\n\n"
+            f"<b>Сервер:</b> {html.escape(server_name)}\n\n"
+            f"Для этих подписок изменение записано в базе, но клиента нет на "
+            f"панели — досылка невозможна, автоматически это не разрешится:\n\n"
+            f"{chr(10).join(lines)}\n\n"
+            f"Восстанавливайте через бота — «Пересобрать» или пересоздание "
+            f"подписки. Если завести клиента руками в панели, у него будет "
+            f"другой UUID, и бот его не подхватит."
+        )
+
+        try:
+            bot = await self._get_bot()
+            for admin_id in admin_ids:
+                try:
+                    await bot.send_message(
+                        chat_id=admin_id, text=message, parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Не удалось уведомить администратора {} о застрявших изменениях: {}",
+                        admin_id, e,
+                    )
+        except Exception as e:
+            logger.error(
+                "Ошибка отправки уведомлений о застрявших изменениях (сервер {}): {}",
+                server_name, e, exc_info=True,
+            )
+
     # === Расхождения БД ↔ панель (governed reconcile) ===
 
     @staticmethod

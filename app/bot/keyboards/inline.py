@@ -101,6 +101,10 @@ def get_admin_clients_menu_keyboard() -> InlineKeyboardMarkup:
         text=t("keyboards.main_menu.admin.broadcast", "📢 Уведомление всем"),
         callback_data="admin_broadcast",
     )
+    builder.button(
+        text=t("keyboards.main_menu.admin.renewals", "💰 Продления"),
+        callback_data="admin_renewals",
+    )
     builder.button(text=t("keyboards.common.back", "🔙 Назад"), callback_data="admin_menu")
     builder.adjust(1)
     return builder.as_markup()
@@ -797,6 +801,10 @@ def get_template_edit_menu_keyboard(template_id: int) -> InlineKeyboardMarkup:
         callback_data=f"template_edit_notes_{template_id}",
     )
     builder.button(
+        text=t("keyboards.template_edit.price", "💰 Цена"),
+        callback_data=f"template_edit_price_{template_id}",
+    )
+    builder.button(
         text=t("keyboards.common.back_icon", "🔙 Назад"),
         callback_data=f"template_select_{template_id}",
     )
@@ -1028,6 +1036,10 @@ def get_subscription_details_keyboard(
     builder.button(
         text=t("keyboards.subscription.edit", "✏️ Редактировать"),
         callback_data=f"admin_sub_edit_{subscription_id}",
+    )
+    builder.button(
+        text=t("keyboards.subscription.price", "💰 Цена"),
+        callback_data=f"admin_sub_price_{subscription_id}",
     )
     builder.button(
         text=t("keyboards.subscription.rebuild", "🔄 Переиспользовать токен"),

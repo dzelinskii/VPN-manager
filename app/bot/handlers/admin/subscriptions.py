@@ -1,5 +1,7 @@
 """Admin subscription management handlers."""
 
+import html
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -7,7 +9,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 from aiogram.types import Message as TgMessage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.bot.filters import AdminFilter
@@ -19,8 +21,14 @@ from app.bot.keyboards import (
 )
 from app.bot.states.admin import SubscriptionManagement, SubscriptionRebuild
 from app.database import async_session_factory
-from app.database.models import Inbound
+from app.database.models import Inbound, Subscription
 from app.services.client_service import ClientService
+from app.services.pricing import (
+    format_price,
+    parse_price_kopecks,
+    resolve_price,
+    set_subscription_price,
+)
 from app.services.xui_service import XUIService
 from app.utils.texts import t
 
@@ -629,6 +637,141 @@ async def create_subscription(callback: CallbackQuery, state: FSMContext) -> Non
 # Additional subscription management handlers
 
 
+def _conn_status_icon(conn, disabled_icon: str = "❌") -> str:
+    """Значок состояния подключения.
+
+    В статусе pending_push строка хранит намерение админа, а не то, что на
+    сервере, — иначе интерфейс показывал бы применённым то, чего на панели нет.
+
+    ``disabled_icon`` отличается у текста и кнопок, поэтому вынесен параметром:
+    дублировать выражение нельзя, иначе значки разъедутся.
+    """
+    if getattr(conn, "sync_status", None) == "pending_push":
+        return "⏳"
+    return "✅" if conn.is_enabled else disabled_icon
+
+
+async def _count_pending_push(session, subscription_id: int) -> int:
+    """Сколько подключений подписки не доехало до сервера.
+
+    Нужно, чтобы не рапортовать «✅ отключено», когда на панели клиент жив.
+    """
+    from app.database.models import InboundConnection
+
+    result = await session.execute(
+        select(func.count())
+        .select_from(InboundConnection)
+        .where(
+            InboundConnection.subscription_id == subscription_id,
+            InboundConnection.sync_status == "pending_push",
+        )
+    )
+    return result.scalar() or 0
+
+
+def _price_line(subscription) -> str:
+    """Цена подписки с пометкой, откуда она взялась."""
+    if subscription.price_kopecks is not None:
+        return f"{format_price(subscription.price_kopecks)} (своя)"
+
+    resolved = resolve_price(subscription)
+    if resolved is None:
+        return format_price(None)
+    return f"{format_price(resolved)} (из шаблона)"
+
+
+@router.callback_query(
+    F.data.startswith("admin_sub_price_")
+    & ~F.data.startswith("admin_sub_price_reset_")
+    & ~F.data.startswith("admin_sub_price_cancel_")
+)
+async def start_edit_subscription_price(callback: CallbackQuery, state: FSMContext) -> None:
+    """Спросить цену подписки."""
+    subscription_id = int(callback.data.split("_")[-1])
+
+    async with async_session_factory() as session:
+        from app.services.new_subscription_service import NewSubscriptionService
+
+        subscription = await NewSubscriptionService(session).get_subscription(subscription_id)
+        if not subscription:
+            await callback.answer("Подписка не найдена", show_alert=True)
+            return
+        current = _price_line(subscription)
+
+    await state.set_state(SubscriptionManagement.editing_subscription_price)
+    await state.update_data(subscription_id=subscription_id)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🔄 Брать из шаблона", callback_data=f"admin_sub_price_reset_{subscription_id}"
+    )
+    # Отмена ведёт через отдельный callback, а не сразу на карточку: иначе
+    # состояние ввода цены остаётся висеть и следующее же число её перезапишет.
+    builder.button(text="🔙 Отмена", callback_data=f"admin_sub_price_cancel_{subscription_id}")
+    builder.adjust(1)
+
+    await callback.message.edit_text(
+        f"💰 <b>Цена подписки</b>\n\nСейчас: {current}\n\n"
+        "Введите цену за 30 дней в рублях, например <code>349.90</code>.\n"
+        "0 = бесплатно.",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_sub_price_cancel_"))
+async def cancel_subscription_price(callback: CallbackQuery, state: FSMContext) -> None:
+    """Выйти из ввода цены, сбросив состояние."""
+    await state.clear()
+    await show_subscription_details(callback)
+
+
+@router.callback_query(F.data.startswith("admin_sub_price_reset_"))
+async def reset_subscription_price(callback: CallbackQuery, state: FSMContext) -> None:
+    """Убрать переопределение — цена снова берётся из шаблона."""
+    subscription_id = int(callback.data.split("_")[-1])
+
+    async with async_session_factory() as session:
+        if not await set_subscription_price(session, subscription_id, None):
+            await callback.answer("Подписка не найдена", show_alert=True)
+            return
+        await session.commit()
+
+    await state.clear()
+    await callback.answer("Цена берётся из шаблона")
+    await show_subscription_details(callback)
+
+
+@router.message(SubscriptionManagement.editing_subscription_price)
+async def process_subscription_price(message: TgMessage, state: FSMContext) -> None:
+    """Сохранить введённую цену подписки."""
+    try:
+        new_price = parse_price_kopecks(message.text or "")
+    except ValueError as e:
+        await message.answer(
+            f"⚠️ {html.escape(str(e))}\n"
+            "Введите цену в рублях, например <code>349.90</code>:"
+        )
+        return
+
+    data = await state.get_data()
+    subscription_id = data.get("subscription_id")
+    await state.clear()
+    if not subscription_id:
+        await message.answer("❌ Контекст устарел, откройте подписку заново.")
+        return
+
+    async with async_session_factory() as session:
+        if not await set_subscription_price(session, int(subscription_id), new_price):
+            await message.answer("⚠️ Подписка не найдена")
+            return
+        await session.commit()
+
+    logger.info("Цена подписки {} обновлена: {}", subscription_id, format_price(new_price))
+    await message.answer(f"✅ Цена: {format_price(new_price)}")
+
+
 @router.callback_query(F.data.startswith("admin_sub_detail_"))
 @router.callback_query(F.data.startswith("client_sub_detail_"))
 async def show_subscription_details(callback: CallbackQuery) -> None:
@@ -699,6 +842,7 @@ async def show_subscription_details(callback: CallbackQuery) -> None:
         "📊 Статус: {status}\n"
         "📦 Трафик: {traffic}\n"
         "⏰ Срок: {expiry}\n"
+        "💰 Цена: {price}\n"
         "📅 Создана: {created_at}\n"
         "🔌 Подключений: {conn_count}\n\n",
         name=subscription.name,
@@ -711,6 +855,7 @@ async def show_subscription_details(callback: CallbackQuery) -> None:
         status=status,
         traffic=traffic,
         expiry=expiry,
+        price=_price_line(subscription),
         created_at=subscription.created_at.strftime("%d.%m.%Y %H:%M"),
         conn_count=len(subscription.inbound_connections),
     )
@@ -797,7 +942,7 @@ async def show_subscription_inbounds(callback: CallbackQuery) -> None:
     builder = InlineKeyboardBuilder()
 
     for conn in connections:
-        status = "✅" if conn.is_enabled else "❌"
+        status = _conn_status_icon(conn)
         inbound = conn.inbound
         server = inbound.server
 
@@ -840,16 +985,13 @@ async def show_subscription_inbounds(callback: CallbackQuery) -> None:
             conn_id=conn.id,
         )
 
-        if conn.is_enabled:
-            builder.button(
-                text=f"✅ {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
-        else:
-            builder.button(
-                text=f"🔌 {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
+        # Тот же значок, что в тексте выше: иначе в одной строке два разных
+        # сигнала о состоянии подключения.
+        icon = _conn_status_icon(conn, disabled_icon="🔌")
+        builder.button(
+            text=f"{icon} {inbound.remark} ({inbound.protocol})",
+            callback_data=f"toggle_conn_{conn.id}",
+        )
         builder.button(text="🗑️", callback_data=f"delete_conn_{conn.id}")
         if conn.type in ("awg_inbound_connection", "mtproxy_inbound_connection"):
             builder.button(
@@ -1353,7 +1495,7 @@ async def toggle_inbound_connection(callback: CallbackQuery) -> None:
             builder = InlineKeyboardBuilder()
 
             for conn in connections:
-                conn_status = "✅" if conn.is_enabled else "❌"
+                conn_status = _conn_status_icon(conn)
                 inbound = conn.inbound
                 server = inbound.server
 
@@ -1617,6 +1759,12 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
                 selectinload(InboundConnection.inbound)
                 .selectinload(Inbound.server)
                 .selectinload(ServerModel.mtproxy_service),
+                # XUI-провайдер читает subscription.subscription_token и
+                # subscription.client.telegram_id — без eager-загрузки это
+                # MissingGreenlet, и массовое переключение молча не работает.
+                selectinload(InboundConnection.subscription).selectinload(
+                    Subscription.client
+                ),
             )
         )
         connections = result.scalars().all()
@@ -1646,9 +1794,21 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
                     provider = providers[cache_key]
 
                     if new_state:
-                        await provider.enable_client(inbound, conn)
+                        applied = await provider.enable_client(inbound, conn)
                     else:
-                        await provider.disable_client(inbound, conn)
+                        applied = await provider.disable_client(inbound, conn)
+
+                    if not applied:
+                        # Не подтверждено сервером — статус не меняем, иначе бот
+                        # покажет «отключено», а подключение продолжит работать.
+                        logger.warning(
+                            "Сервер не подтвердил {} подключения {}", action, conn.id
+                        )
+                        # Не затираем pending_push: он помечает неотправленное
+                        # изменение и учитывается в счётчике «не применилось».
+                        if conn.sync_status != "pending_push":
+                            conn.sync_status = "error"
+                        continue
 
                     conn.is_enabled = new_state
                     success_count += 1
@@ -1681,7 +1841,7 @@ async def confirm_multi_select_action(callback: CallbackQuery, state: FSMContext
             builder = InlineKeyboardBuilder()
 
             for conn in updated_connections:
-                status = "✅" if conn.is_enabled else "❌"
+                status = _conn_status_icon(conn)
                 inbound = conn.inbound
                 server = inbound.server
 
@@ -1824,7 +1984,7 @@ async def exit_multi_select_mode(callback: CallbackQuery, state: FSMContext) -> 
     builder = InlineKeyboardBuilder()
 
     for conn in connections:
-        status = "✅" if conn.is_enabled else "❌"
+        status = _conn_status_icon(conn)
         inbound = conn.inbound
         server = inbound.server
 
@@ -1848,16 +2008,13 @@ async def exit_multi_select_mode(callback: CallbackQuery, state: FSMContext) -> 
         )
 
         # Add buttons for each inbound
-        if conn.is_enabled:
-            builder.button(
-                text=f"✅ {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
-        else:
-            builder.button(
-                text=f"🔌 {inbound.remark} ({inbound.protocol})",
-                callback_data=f"toggle_conn_{conn.id}",
-            )
+        # Тот же значок, что в тексте выше: иначе в одной строке два разных
+        # сигнала о состоянии подключения.
+        icon = _conn_status_icon(conn, disabled_icon="🔌")
+        builder.button(
+            text=f"{icon} {inbound.remark} ({inbound.protocol})",
+            callback_data=f"toggle_conn_{conn.id}",
+        )
         builder.button(text="🗑️", callback_data=f"delete_conn_{conn.id}")
         builder.adjust(2)
 
@@ -2293,10 +2450,18 @@ async def enable_subscription(callback: CallbackQuery) -> None:
         service = NewSubscriptionService(session)
         try:
             await service.update_subscription(subscription_id, is_active=True)
+            pending = await _count_pending_push(session, subscription_id)
             await session.commit()
         finally:
             await service.close_all_clients()
-    await callback.answer(t("admin.subscriptions.enabled_success", "✅ Подписка включена."))
+
+    if pending:
+        await callback.answer(
+            f"⚠️ Включено в базе, но {pending} подключений не применились на сервере",
+            show_alert=True,
+        )
+    else:
+        await callback.answer(t("admin.subscriptions.enabled_success", "✅ Подписка включена."))
     await show_subscription_details(callback)
 
 
@@ -2311,10 +2476,20 @@ async def disable_subscription(callback: CallbackQuery) -> None:
         service = NewSubscriptionService(session)
         try:
             await service.update_subscription(subscription_id, is_active=False)
+            pending = await _count_pending_push(session, subscription_id)
             await session.commit()
         finally:
             await service.close_all_clients()
-    await callback.answer(t("admin.subscriptions.disabled_success", "✅ Подписка отключена."))
+
+    if pending:
+        await callback.answer(
+            f"⚠️ Отключено в базе, но {pending} подключений остались живыми на сервере",
+            show_alert=True,
+        )
+    else:
+        await callback.answer(
+            t("admin.subscriptions.disabled_success", "✅ Подписка отключена.")
+        )
     await show_subscription_details(callback)
 
 

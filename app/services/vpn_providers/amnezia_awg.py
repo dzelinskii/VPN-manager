@@ -20,6 +20,20 @@ from app.services.vpn_providers.base import BaseVPNProvider
 
 I1_DEFAULT = "<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>"
 
+# Клиентские параметры AWG 3.1 (формат template.conf из amnezia-client).
+# Диапазоны таймингов клиент рандомизирует сам при каждом запуске.
+V3_CLIENT_PADDING = "10-100"
+V3_CLIENT_REKEY_AFTER_TIME = "100-120"
+V3_CLIENT_REKEY_TIMEOUT = "3-7"
+V3_CLIENT_REJECT_AFTER_TIME = "150-180"
+V3_CLIENT_KEEPALIVE_TIMEOUT = "5-15"
+V3_CLIENT_MAX_HANDSHAKE_ATTEMPTS = "15-20"
+
+
+def _is_v3_obfuscation(obfuscation: dict | None) -> bool:
+    """Сервер установлен в формате 3.1 — в obfuscation лежит HeaderProtectionKey."""
+    return bool(obfuscation and obfuscation.get("HeaderProtectionKey"))
+
 
 class AmneziaAWGProvider(BaseVPNProvider):
     """Provider for AmneziaWG via direct SSH and Docker execution.
@@ -339,6 +353,25 @@ class AmneziaAWGProvider(BaseVPNProvider):
             val = obfuscation.get(key)
             if val:
                 config_lines.append(f"{key} = {val}")
+        if _is_v3_obfuscation(obfuscation):
+            # Формат 3.1: ключ шифрования заголовков общий для клиента и сервера,
+            # плюс новые клиентские параметры из template.conf amnezia-client.
+            v3_client_params = {
+                "HeaderProtectionKey": obfuscation["HeaderProtectionKey"],
+                "ContentPaddingAddition": V3_CLIENT_PADDING,
+                "RekeyAfterTime": V3_CLIENT_REKEY_AFTER_TIME,
+                "RekeyTimeout": V3_CLIENT_REKEY_TIMEOUT,
+                "RejectAfterTime": V3_CLIENT_REJECT_AFTER_TIME,
+                "KeepaliveTimeout": V3_CLIENT_KEEPALIVE_TIMEOUT,
+                "MaxHandshakeAttempts": V3_CLIENT_MAX_HANDSHAKE_ATTEMPTS,
+                "RandomTrailers": obfuscation.get("RandomTrailers") or "on",
+                "DisableCookies": obfuscation.get("DisableCookies") or "on",
+            }
+        else:
+            v3_client_params = {}
+        for key, val in v3_client_params.items():
+            if val:
+                config_lines.append(f"{key} = {val}")
         for key in i_keys:
             val = i_params.get(key, "")
             if val:
@@ -373,6 +406,9 @@ class AmneziaAWGProvider(BaseVPNProvider):
         }
         for key in obfs_keys:
             amnezia_json[key] = obfuscation.get(key, "")
+        for key, val in v3_client_params.items():
+            if val:
+                amnezia_json[key] = val
         # Пустые I-параметры доезжают до движка как `i2=` без значения и ломают
         # разбор конфига, поэтому передаём только заполненные.
         for key in i_keys:

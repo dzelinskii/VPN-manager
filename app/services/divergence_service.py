@@ -276,4 +276,8 @@ class DivergenceService:
             )
         ).scalars().all()
         for r in rows:
-            r.sync_status = "synced"
+            # Соседняя строка может ждать отправки собственного изменения на
+            # другой inbound — восстановление этого клиента её не применило,
+            # и снимать признак нельзя.
+            if r.sync_status != "pending_push":
+                r.sync_status = "synced"
