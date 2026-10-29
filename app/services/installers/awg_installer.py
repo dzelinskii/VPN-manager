@@ -34,6 +34,16 @@ AWG_SUBNET_IP_DEFAULT = "10.8.0.1"
 
 I1_DEFAULT = "<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>"
 
+# Тайминги 3.1: официальный клиент AmneziaVPN пишет их и в серверный, и в
+# клиентский конфиг (диапазоны — клиент рандомизирует при каждом запуске).
+V3_TIMING_DEFAULTS = {
+    "RekeyAfterTime": "100-120",
+    "RekeyTimeout": "3-7",
+    "RejectAfterTime": "150-180",
+    "KeepaliveTimeout": "5-15",
+    "MaxHandshakeAttempts": "15-20",
+}
+
 
 def generate_obfuscation_params() -> dict[str, str]:
     """Generate AWG 3.1 obfuscation parameters matching original AmneziaVPN.
@@ -41,6 +51,7 @@ def generate_obfuscation_params() -> dict[str, str]:
     S1-S4: fixed 12 (HeaderProtectionKey требует S1-S4 >= 12).
     H1-H4: фиксированные 1..4 — случайные диапазоны в 3.x больше не нужны.
     RandomTrailers/DisableCookies: новые тумблеры 3.1, всегда on.
+    Тайминги Rekey*/Reject*/Keepalive*: общие для сервера и клиента.
     I1: DNS A response for icloud.com (default anti-DPI junk).
     I2-I5: empty (reserved for future use).
     HeaderProtectionKey генерируется отдельно на сервере (awg genkey)
@@ -60,12 +71,49 @@ def generate_obfuscation_params() -> dict[str, str]:
         "H4": "4",
         "RandomTrailers": "on",
         "DisableCookies": "on",
+        **V3_TIMING_DEFAULTS,
         "I1": I1_DEFAULT,
         "I2": "",
         "I3": "",
         "I4": "",
         "I5": "",
     }
+
+
+def build_awg0_conf(
+    private_key: str,
+    subnet_ip: str,
+    subnet_cidr: int,
+    port: int,
+    header_protection_key: str,
+    obfuscation: dict[str, str],
+) -> str:
+    """Собрать серверный awg0.conf.
+
+    Порядок строк повторяет конфиг официального приложения AmneziaVPN 3.1:
+    Jc..H4, HeaderProtectionKey, тайминги, RandomTrailers/DisableCookies,
+    закомментированные I1-I5.
+    """
+    obf_keys = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"]
+    v3_keys = ["RandomTrailers", "DisableCookies"]
+    i_keys = ["I1", "I2", "I3", "I4", "I5"]
+
+    obf_lines = "\n".join(f"{k} = {obfuscation[k]}" for k in obf_keys if obfuscation.get(k))
+    timing_lines = "\n".join(f"{k} = {obfuscation[k]}" for k in V3_TIMING_DEFAULTS if obfuscation.get(k))
+    v3_lines = "\n".join(f"{k} = {obfuscation[k]}" for k in v3_keys if obfuscation.get(k))
+    i_lines = "\n".join(f"# {k} = {obfuscation.get(k, '')}" for k in i_keys)
+
+    return (
+        f"[Interface]\n"
+        f"PrivateKey = {private_key}\n"
+        f"Address = {subnet_ip}/{subnet_cidr}\n"
+        f"ListenPort = {port}\n"
+        f"{obf_lines}\n"
+        f"HeaderProtectionKey = {header_protection_key}\n"
+        f"{timing_lines}\n"
+        f"{v3_lines}\n"
+        f"{i_lines}\n"
+    )
 
 
 class AWGInstaller(BaseInstaller):
@@ -90,7 +138,7 @@ class AWGInstaller(BaseInstaller):
 
             obfuscation = {}
             for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4",
-                        "RandomTrailers", "DisableCookies"):
+                        "RandomTrailers", "DisableCookies", *V3_TIMING_DEFAULTS):
                 m = re.search(rf"{key}\s*=\s*(.+)", config)
                 if m:
                     obfuscation[key] = m.group(1).strip()
@@ -337,23 +385,13 @@ tail -f /dev/null
                 input_data=content,
             )
 
-        obf_keys = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"]
-        obf_lines = "\n".join(f"{k} = {obfuscation[k]}" for k in obf_keys if obfuscation.get(k))
-
-        v3_keys = ["RandomTrailers", "DisableCookies"]
-        obf_lines += "\n" + "\n".join(f"{k} = {obfuscation[k]}" for k in v3_keys if obfuscation.get(k))
-
-        i_keys = ["I1", "I2", "I3", "I4", "I5"]
-        i_lines = "\n".join(f"# {k} = {obfuscation.get(k, '')}" for k in i_keys)
-
-        config = (
-            f"[Interface]\n"
-            f"PrivateKey = {private_key}\n"
-            f"Address = {subnet_ip}/{subnet_cidr}\n"
-            f"ListenPort = {port}\n"
-            f"HeaderProtectionKey = {header_protection_key}\n"
-            f"{obf_lines}\n"
-            f"{i_lines}\n"
+        config = build_awg0_conf(
+            private_key.strip(),
+            subnet_ip,
+            subnet_cidr,
+            port,
+            header_protection_key.strip(),
+            obfuscation,
         )
 
         await self._cmd(

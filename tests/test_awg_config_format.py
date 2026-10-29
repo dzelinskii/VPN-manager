@@ -31,13 +31,18 @@ OBFUSCATION_V3 = {
     "S1": "12", "S2": "12", "S3": "12", "S4": "12",
     "H1": "1", "H2": "2", "H3": "3", "H4": "4",
     "RandomTrailers": "on", "DisableCookies": "on",
+    "RekeyAfterTime": "100-120",
+    "RekeyTimeout": "3-7",
+    "RejectAfterTime": "150-180",
+    "KeepaliveTimeout": "5-15",
+    "MaxHandshakeAttempts": "15-20",
     "HeaderProtectionKey": "hEaDeRpRoTeCtIoNkEy1234567890abcdefghijklmnop=",
 }
 
 # Новые клиентские поля 3.1 (формат template.conf из amnezia-client).
+# ContentPaddingAddition официальный клиент не выставляет — у нас его тоже нет.
 V3_CLIENT_FIELDS = {
     "HeaderProtectionKey": OBFUSCATION_V3["HeaderProtectionKey"],
-    "ContentPaddingAddition": "10-100",
     "RekeyAfterTime": "100-120",
     "RekeyTimeout": "3-7",
     "RejectAfterTime": "150-180",
@@ -176,8 +181,42 @@ def test_generate_obfuscation_params_v3_defaults():
     assert obf["Jmin"] == "10"
     assert obf["Jmax"] == "50"
     assert 4 <= int(obf["Jc"]) <= 6
+    # Тайминги 3.1 — общие для серверного и клиентского конфига.
+    from app.services.installers.awg_installer import V3_TIMING_DEFAULTS
+    for key, val in V3_TIMING_DEFAULTS.items():
+        assert obf[key] == val
     # HP-ключ генерируется на сервере при установке, в шаблоне его нет.
     assert "HeaderProtectionKey" not in obf
+
+
+def test_server_conf_matches_official_31():
+    """Серверный awg0.conf повторяет конфиг официального приложения 3.1.
+
+    Эталон снят с контейнера, установленного официальным клиентом AmneziaVPN:
+    Jc..H4, HeaderProtectionKey, пять таймингов, RandomTrailers/DisableCookies,
+    закомментированный I1; ContentPaddingAddition в серверном конфиге нет.
+    """
+    from app.services.installers.awg_installer import build_awg0_conf, generate_obfuscation_params
+
+    hpk = "hEaDeRpRoTeCtIoNkEy1234567890abcdefghijklmnop="
+    conf = build_awg0_conf("sErVeRpRiVaTeKeY=", "10.8.0.1", 24, 443, hpk, generate_obfuscation_params())
+
+    lines = [ln.strip() for ln in conf.splitlines()]
+    assert "ListenPort = 443" in lines
+    assert f"HeaderProtectionKey = {hpk}" in lines
+    assert "RandomTrailers = on" in lines
+    assert "DisableCookies = on" in lines
+    assert "RekeyAfterTime = 100-120" in lines
+    assert "RekeyTimeout = 3-7" in lines
+    assert "RejectAfterTime = 150-180" in lines
+    assert "KeepaliveTimeout = 5-15" in lines
+    assert "MaxHandshakeAttempts = 15-20" in lines
+    assert any(ln.startswith("# I1 = <r 2><b 0x") for ln in lines)
+    assert "ContentPaddingAddition" not in conf
+
+    # Порядок как у официального приложения: H4 -> HPK -> тайминги -> тумблеры.
+    idx = {ln.split(" =")[0]: lines.index(ln) for ln in lines if " = " in ln and not ln.startswith("#")}
+    assert idx["H4"] < idx["HeaderProtectionKey"] < idx["RekeyAfterTime"] < idx["RandomTrailers"]
 
 
 @pytest.mark.asyncio
@@ -193,6 +232,10 @@ async def test_v3_config_contains_31_fields():
         line = f"{key} = {val}"
         assert line in config["config_data"], f"в .conf нет строки '{line}'"
 
+    # Официальный клиент ContentPaddingAddition не выставляет — мы тоже.
+    assert "ContentPaddingAddition" not in config["config_data"]
+    assert "ContentPaddingAddition" not in config["vpn_uri"]
+
     last_config = json.loads(
         _decode_vpn_uri(config["vpn_uri"])["containers"][0]["awg"]["last_config"]
     )
@@ -203,6 +246,53 @@ async def test_v3_config_contains_31_fields():
     # 2.x-поля при этом остаются (клиент 3.1 читает и их).
     for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1"):
         assert isinstance(last_config[key], str)
+
+
+@pytest.mark.asyncio
+async def test_v3_vpn_uri_matches_official_export_shape():
+    """vpn:// для 3.1-сервера повторяет структуру экспорта официального клиента.
+
+    Эталон снят с vpn:// официального приложения AmneziaVPN 3.1:
+    protocol_version="3.1", format_version=1, обфускация продублирована на
+    уровень контейнера. Легаси-экспорт 2.x при этом не меняется.
+    """
+    with patch("app.config.get_settings", return_value=_make_settings_mock()), \
+         patch("app.database._get_engine", return_value=MagicMock()), \
+         patch("app.database._get_session_factory", return_value=MagicMock()):
+        provider, inbound, connection = _build_provider(obfuscation=OBFUSCATION_V3)
+        config = await provider.get_client_config(inbound, connection)
+
+    server_config = _decode_vpn_uri(config["vpn_uri"])
+    assert server_config["format_version"] == 1
+
+    awg = server_config["containers"][0]["awg"]
+    assert awg["protocol_version"] == "3.1"
+    # Обфускация и HPK продублированы на уровень контейнера.
+    for key in ("Jc", "Jmin", "Jmax", "S1", "S4", "H1", "H4", "I1",
+                "HeaderProtectionKey", "RekeyAfterTime", "MaxHandshakeAttempts",
+                "RandomTrailers", "DisableCookies"):
+        assert awg.get(key), f"{key} должен быть на уровне контейнера"
+    # Пустые I2-I5 на уровень контейнера не попадают.
+    for key in ("I2", "I3", "I4", "I5"):
+        assert key not in awg
+
+
+@pytest.mark.asyncio
+async def test_legacy_vpn_uri_keeps_2x_shape():
+    """vpn:// для сервера 2.x не получает поля формата 3.1."""
+    with patch("app.config.get_settings", return_value=_make_settings_mock()), \
+         patch("app.database._get_engine", return_value=MagicMock()), \
+         patch("app.database._get_session_factory", return_value=MagicMock()):
+        provider, inbound, connection = _build_provider(obfuscation=dict(OBFUSCATION))
+        config = await provider.get_client_config(inbound, connection)
+
+    server_config = _decode_vpn_uri(config["vpn_uri"])
+    assert "format_version" not in server_config
+
+    awg = server_config["containers"][0]["awg"]
+    assert awg["protocol_version"] == "2"
+    for key in ("Jc", "HeaderProtectionKey", "RandomTrailers"):
+        assert key not in awg, f"{key} не должен дублироваться для сервера 2.x"
 
 
 @pytest.mark.asyncio
