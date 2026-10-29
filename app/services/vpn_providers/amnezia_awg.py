@@ -15,19 +15,15 @@ import qrcode
 from loguru import logger
 
 from app.database.models import Inbound, InboundConnection, Server, Subscription
+from app.services.installers.awg_installer import V3_TIMING_DEFAULTS
 from app.services.ssh_service import SSHManager
 from app.services.vpn_providers.base import BaseVPNProvider
 
 I1_DEFAULT = "<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>"
 
-# Клиентские параметры AWG 3.1 (формат template.conf из amnezia-client).
-# Диапазоны таймингов клиент рандомизирует сам при каждом запуске.
-V3_CLIENT_PADDING = "10-100"
-V3_CLIENT_REKEY_AFTER_TIME = "100-120"
-V3_CLIENT_REKEY_TIMEOUT = "3-7"
-V3_CLIENT_REJECT_AFTER_TIME = "150-180"
-V3_CLIENT_KEEPALIVE_TIMEOUT = "5-15"
-V3_CLIENT_MAX_HANDSHAKE_ATTEMPTS = "15-20"
+# Тайминги 3.1 общие для сервера и клиента (см. V3_TIMING_DEFAULTS в
+# awg_installer). ContentPaddingAddition официальный клиент не выставляет —
+# не выставляем и мы.
 
 
 def _is_v3_obfuscation(obfuscation: dict | None) -> bool:
@@ -355,15 +351,10 @@ class AmneziaAWGProvider(BaseVPNProvider):
                 config_lines.append(f"{key} = {val}")
         if _is_v3_obfuscation(obfuscation):
             # Формат 3.1: ключ шифрования заголовков общий для клиента и сервера,
-            # плюс новые клиентские параметры из template.conf amnezia-client.
+            # тайминги берём из obfuscation сервера (fallback — дефолты 3.1).
             v3_client_params = {
                 "HeaderProtectionKey": obfuscation["HeaderProtectionKey"],
-                "ContentPaddingAddition": V3_CLIENT_PADDING,
-                "RekeyAfterTime": V3_CLIENT_REKEY_AFTER_TIME,
-                "RekeyTimeout": V3_CLIENT_REKEY_TIMEOUT,
-                "RejectAfterTime": V3_CLIENT_REJECT_AFTER_TIME,
-                "KeepaliveTimeout": V3_CLIENT_KEEPALIVE_TIMEOUT,
-                "MaxHandshakeAttempts": V3_CLIENT_MAX_HANDSHAKE_ATTEMPTS,
+                **{k: obfuscation.get(k) or v for k, v in V3_TIMING_DEFAULTS.items()},
                 "RandomTrailers": obfuscation.get("RandomTrailers") or "on",
                 "DisableCookies": obfuscation.get("DisableCookies") or "on",
             }
@@ -416,20 +407,31 @@ class AmneziaAWGProvider(BaseVPNProvider):
                 amnezia_json[key] = val
 
         subnet = f"{awg.subnet_ip}/{awg.subnet_cidr}" if awg.subnet_ip else "10.8.0.0/24"
+        is_v3 = bool(v3_client_params)
+        awg_settings = {
+            "port": port,
+            "transport_proto": "udp",
+            "subnet_address": subnet,
+            "mtu": "1280",
+            "protocol_version": "3.1" if is_v3 else "2",
+            "last_config": json.dumps(amnezia_json, ensure_ascii=False),
+        }
+        if is_v3:
+            # Официальный экспорт 3.1 дублирует параметры обфускации на уровень
+            # контейнера, а не только в last_config. Пустые I2-I5 не пишем —
+            # клиент может скормить их движку как пустые значения.
+            for key in (*obfs_keys, *v3_client_params, *i_keys):
+                val = v3_client_params.get(key) or obfuscation.get(key) or i_params.get(key)
+                if val:
+                    awg_settings[key] = val
         awg_container = {
             "container": "amnezia-awg2",
-            "awg": {
-                "port": port,
-                "transport_proto": "udp",
-                "subnet_address": subnet,
-                "mtu": "1280",
-                "protocol_version": "2",
-                "last_config": json.dumps(amnezia_json, ensure_ascii=False),
-            },
+            "awg": awg_settings,
         }
         server_config = {
             "hostName": host,
             "description": self.server.name or "VPN Server",
+            **({"format_version": 1} if is_v3 else {}),
             "dns1": "1.1.1.1",
             "dns2": "8.8.8.8",
             "defaultContainer": "amnezia-awg2",
