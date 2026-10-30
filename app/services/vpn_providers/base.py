@@ -12,7 +12,7 @@ class BaseVPNProvider(ABC):
 
     All VPN providers (XUI, AmneziaWG, MTProxy) must implement this interface.
     Protocol-specific limitations:
-    - AWG: no traffic tracking, enable/disable is kernel-level peer management
+    - AWG: enable/disable is kernel-level peer management; traffic via `awg show dump`
     - MTProxy: no traffic tracking, no per-user expiry
     - XUI: full REST API with all features
     """

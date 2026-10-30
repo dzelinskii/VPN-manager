@@ -1,6 +1,7 @@
 """AmneziaWG (AWG/AWG2) Provider implementation."""
 
 import base64
+import contextlib
 import io
 import ipaddress
 import json
@@ -8,7 +9,7 @@ import re
 import struct
 import uuid
 import zlib
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import qrcode
@@ -25,10 +26,22 @@ I1_DEFAULT = "<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c
 # awg_installer). ContentPaddingAddition официальный клиент не выставляет —
 # не выставляем и мы.
 
+DEFAULT_CONTAINER_NAME = "vpnbot-awg"
+# Legacy-контейнер официального приложения (AWG v1/v2): старые тулзы wg,
+# конфиг wg0.conf, интерфейс wg0. Актуальный контейнер приложения — amnezia-awg2.
+LEGACY_OFFICIAL_CONTAINER = "amnezia-awg"
+# clientsTable официального приложения: JSON-массив в ФС контейнера
+# (/opt/amnezia/awg/clientsTable — для awg и awg2 папка одна, containerUtils.cpp).
+CLIENTS_TABLE_PATH = "/opt/amnezia/awg/clientsTable"
+
 
 def _is_v3_obfuscation(obfuscation: dict | None) -> bool:
     """Сервер установлен в формате 3.1 — в obfuscation лежит HeaderProtectionKey."""
     return bool(obfuscation and obfuscation.get("HeaderProtectionKey"))
+
+
+def _looks_like_wireguard_key(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9+/]{43}=", value))
 
 
 class AmneziaAWGProvider(BaseVPNProvider):
@@ -37,24 +50,42 @@ class AmneziaAWGProvider(BaseVPNProvider):
     Client lifecycle:
     - add_client: generates keys, allocates IP, adds peer to config + kernel
     - enable_client: re-adds peer to config + kernel (keys/IP from DB, same config for user)
-    - disable_client: removes peer from kernel only (config entry + IP preserved)
+    - disable_client: removes peer from kernel + config (IP in DB preserved)
     - remove_client: removes peer from kernel + config, frees IP
+
+    Контейнер берётся из AWGService.container_name: это может быть как свой
+    vpnbot-awg, так и контейнер официального приложения (amnezia-awg2 или
+    legacy amnezia-awg) — модель управления пирами у обеих сторон одинаковая
+    (append/удаление своей секции [Peer] + syncconf), см.
+    docs/amnezia-awg-parallel-management.md.
     """
 
     def __init__(self, server: Server) -> None:
         super().__init__(server)
         self.ssh = SSHManager(server)
-        self.container_name = "vpnbot-awg"
-        self.config_path = "/opt/amnezia/awg/awg0.conf"
-        self.interface_name = "awg0"
+        self.container_name = DEFAULT_CONTAINER_NAME
+        try:
+            awg = server.awg_service
+            if awg is not None and awg.container_name:
+                self.container_name = awg.container_name
+        except Exception:
+            # Отвязанный объект (lazy-load недоступен) — работаем с дефолтом.
+            pass
+        if self.container_name == LEGACY_OFFICIAL_CONTAINER:
+            self.config_path = "/opt/amnezia/awg/wg0.conf"
+            self.interface_name = "wg0"
+            self._bin = "wg"
+            self._quick_bin = "wg-quick"
+        else:
+            self.config_path = "/opt/amnezia/awg/awg0.conf"
+            self.interface_name = "awg0"
+            self._bin = "awg"
+            self._quick_bin = "awg-quick"
         self._is_root = (server.ssh_user == "root")
 
     async def _cmd(self, cmd: str, input_data: str | None = None) -> str:
         """Run command with sudo if needed."""
-        if self._is_root:
-            full_cmd = cmd
-        else:
-            full_cmd = f"sudo -n {cmd}"
+        full_cmd = cmd if self._is_root else f"sudo -n {cmd}"
         return await self.ssh.run_command(full_cmd, input_data=input_data)
 
     async def _get_server_psk(self) -> str:
@@ -63,7 +94,9 @@ class AmneziaAWGProvider(BaseVPNProvider):
             return await self._cmd(cmd)
         except Exception:
             logger.warning("Не удалось прочитать PSK с сервера, генерирую новый")
-            return await self._cmd(f"docker exec -i {self.container_name} awg genpsk")
+            return await self._cmd(
+                f"docker exec -i {self.container_name} {self._bin} genpsk"
+            )
 
     async def _get_server_public_key(self) -> str:
         cmd = f"docker exec -i {self.container_name} cat /opt/amnezia/awg/wireguard_server_public_key.key"
@@ -142,7 +175,8 @@ class AmneziaAWGProvider(BaseVPNProvider):
     async def _sync_config(self) -> None:
         sync_cmd = (
             f"docker exec -i {self.container_name} bash -c "
-            f"'awg syncconf {self.interface_name} <(awg-quick strip {self.config_path})'"
+            f"'{self._bin} syncconf {self.interface_name} "
+            f"<({self._quick_bin} strip {self.config_path})'"
         )
         await self._cmd(sync_cmd)
 
@@ -174,7 +208,10 @@ class AmneziaAWGProvider(BaseVPNProvider):
         return "EXISTS" in status
 
     async def _kick_peer_from_kernel(self, public_key: str) -> None:
-        kick_cmd = f"docker exec -i {self.container_name} awg set {self.interface_name} peer {public_key} remove"
+        kick_cmd = (
+            f"docker exec -i {self.container_name} "
+            f"{self._bin} set {self.interface_name} peer {public_key} remove"
+        )
         await self._cmd(kick_cmd)
 
     # ── CRUD ──────────────────────────────────────────────────────────
@@ -186,11 +223,11 @@ class AmneziaAWGProvider(BaseVPNProvider):
         client_uuid: str | None = None,
         email: str | None = None,
     ) -> dict[str, Any]:
-        priv_key_cmd = f"docker exec -i {self.container_name} awg genkey"
+        priv_key_cmd = f"docker exec -i {self.container_name} {self._bin} genkey"
         private_key = (await self._cmd(priv_key_cmd)).strip()
 
         public_key = (await self._cmd(
-            f"docker exec -i {self.container_name} awg pubkey",
+            f"docker exec -i {self.container_name} {self._bin} pubkey",
             input_data=private_key,
         )).strip()
 
@@ -199,6 +236,9 @@ class AmneziaAWGProvider(BaseVPNProvider):
 
         await self._add_peer_to_config(public_key, psk, next_ip)
         await self._sync_config()
+        # Человеческое имя в UI официального приложения (иначе там будет «Client N»).
+        with contextlib.suppress(Exception):
+            await self.upsert_clients_table_entry(public_key, subscription.name)
 
         srv_params = await self._get_awg_server_params()
 
@@ -220,6 +260,8 @@ class AmneziaAWGProvider(BaseVPNProvider):
             await self._kick_peer_from_kernel(public_key)
             await self._remove_peer_from_config(public_key)
             await self._sync_config()
+            with contextlib.suppress(Exception):
+                await self.remove_clients_table_entry(public_key)
             return True
         except Exception as e:
             logger.error("Не удалось удалить AWG-клиента: {}", e)
@@ -247,6 +289,14 @@ class AmneziaAWGProvider(BaseVPNProvider):
             if not await self._peer_in_config(public_key):
                 await self._add_peer_to_config(public_key, psk, client_ip)
             await self._sync_config()
+            # Восстановление после wipe/перевыпуска: имя берём из подписки, если она
+            # догружена; clientsTable — best-effort, ошибку глотаем.
+            with contextlib.suppress(Exception):
+                name = None
+                if connection.subscription is not None:
+                    name = connection.subscription.name
+                if name:
+                    await self.upsert_clients_table_entry(public_key, name)
             return True
         except Exception as e:
             logger.error("Не удалось включить AWG-клиента: {}", e)
@@ -274,7 +324,217 @@ class AmneziaAWGProvider(BaseVPNProvider):
     async def get_client_traffic(
         self, inbound: Inbound, connection: InboundConnection
     ) -> dict[str, Any] | None:
-        return None
+        stats = await self._get_peers_stats()
+        peer = stats.get(connection.public_key or "")
+        if peer is None:
+            return None
+        # rx на сервере = трафик, принятый от клиента (upload),
+        # tx = отправленное клиенту (download).
+        return {
+            "upload": peer["tx"],
+            "download": peer["rx"],
+            "total": peer["rx"] + peer["tx"],
+            "last_handshake": peer["last_handshake"],
+        }
+
+    # ── Интероп с официальным клиентом Amnezia ────────────────────────
+
+    async def read_live_config(self) -> str:
+        """Живой awg0.conf из контейнера (источник истины по пирам)."""
+        return await self._cmd(
+            f"docker exec -i {self.container_name} cat {self.config_path}"
+        )
+
+    async def get_live_server_keys(self) -> dict[str, str | None]:
+        """Живые серверные pubkey/HeaderProtectionKey — вход детектора wipe.
+
+        Возвращает значения с сервера; ключи, которые прочитать не удалось,
+        остаются None (детектор сравнивает только пары «есть в БД и есть живой»).
+        """
+        public_key = None
+        with contextlib.suppress(Exception):
+            public_key = (await self._get_server_public_key()).strip() or None
+
+        header_protection_key = None
+        with contextlib.suppress(Exception):
+            config_text = await self.read_live_config()
+            m = re.search(r"HeaderProtectionKey\s*=\s*(\S+)", config_text)
+            if m:
+                header_protection_key = m.group(1).strip()
+
+        return {
+            "server_public_key": public_key,
+            "HeaderProtectionKey": header_protection_key,
+        }
+
+    async def _get_peers_stats(self) -> dict[str, dict[str, int]]:
+        """rx/tx/last-handshake по пирам из `awg show <if> dump`.
+
+        Формат peer-строки (8 полей): pubkey, psk, endpoint, allowed-ips,
+        latest-handshake, rx, tx, keepalive. Строка интерфейса (приватный
+        ключ + порт) короче — отсеиваем по числу полей.
+        """
+        try:
+            dump = await self._cmd(
+                f"docker exec -i {self.container_name} "
+                f"{self._bin} show {self.interface_name} dump"
+            )
+        except Exception as e:
+            logger.debug("AWG: не удалось прочитать show dump: {}", e)
+            return {}
+
+        stats: dict[str, dict[str, int]] = {}
+        for line in dump.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) < 8 or not _looks_like_wireguard_key(parts[0]):
+                continue
+            try:
+                stats[parts[0]] = {
+                    "last_handshake": int(parts[4]),
+                    "rx": int(parts[5]),
+                    "tx": int(parts[6]),
+                }
+            except ValueError:
+                continue
+        return stats
+
+    async def list_peers(self) -> list[dict[str, Any]]:
+        """Все пиры живого конфига, объединённые с clientsTable и статистикой.
+
+        Каждая запись: public_key, psk, client_ip, name (из clientsTable),
+        rx/tx/last_handshake (из `awg show dump`). Поднимает исключение, если
+        конфиг не читается — вызывающий не должен делать выводов по пустому
+        результату.
+        """
+        config_text = await self.read_live_config()
+
+        peers: list[dict[str, Any]] = []
+        for block in config_text.split("[Peer]")[1:]:
+            public_key = psk = client_ip = None
+            for line in block.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("PublicKey"):
+                    public_key = stripped.split("=", 1)[1].strip()
+                elif stripped.startswith("PresharedKey"):
+                    psk = stripped.split("=", 1)[1].strip()
+                elif stripped.startswith("AllowedIPs"):
+                    allowed = stripped.split("=", 1)[1].strip()
+                    client_ip = allowed.split(",")[0].removesuffix("/32")
+            if not public_key:
+                continue
+            peers.append({
+                "public_key": public_key,
+                "psk": psk,
+                "client_ip": client_ip,
+            })
+
+        if peers:
+            table = await self._read_clients_table()
+            stats = await self._get_peers_stats()
+            for peer in peers:
+                entry = table.get(peer["public_key"], {})
+                peer["name"] = entry.get("clientName") or ""
+                peer_stat = stats.get(peer["public_key"], {})
+                peer["rx"] = peer_stat.get("rx", 0)
+                peer["tx"] = peer_stat.get("tx", 0)
+                peer["last_handshake"] = peer_stat.get("last_handshake", 0)
+
+        return peers
+
+    async def _read_clients_table(self) -> dict[str, dict[str, Any]]:
+        """clientsTable официального приложения → {pubkey: userData}.
+
+        Актуальный формат — JSON-массив [{clientId, userData}]; старый
+        объект-словарь клиент мигрирует сам, мы его просто читаем на всякий
+        случай. Отсутствие/битый файл не ошибка — возвращаем пусто.
+        """
+        try:
+            raw = await self._cmd(
+                f"docker exec -i {self.container_name} cat {CLIENTS_TABLE_PATH}"
+            )
+            data = json.loads(raw.strip() or "null")
+        except Exception:
+            return {}
+
+        result: dict[str, dict[str, Any]] = {}
+        if isinstance(data, list):
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                client_id = entry.get("clientId")
+                if client_id:
+                    result[client_id] = entry.get("userData") or {}
+        elif isinstance(data, dict):
+            for client_id, payload in data.items():
+                result[client_id] = (payload or {}).get("userData", payload or {})
+        return result
+
+    async def _write_clients_table(self, entries: list[dict[str, Any]]) -> None:
+        payload = json.dumps(entries, ensure_ascii=False)
+        await self._cmd(
+            f"docker exec -i {self.container_name} bash -c 'cat > {CLIENTS_TABLE_PATH}'",
+            input_data=payload,
+        )
+
+    async def _load_clients_table_entries(self) -> list[dict[str, Any]]:
+        """Текущий clientsTable как список записей (для точечных правок)."""
+        try:
+            raw = await self._cmd(
+                f"docker exec -i {self.container_name} cat {CLIENTS_TABLE_PATH}"
+            )
+            data = json.loads(raw.strip() or "null")
+        except Exception:
+            return []
+        if isinstance(data, list):
+            return [e for e in data if isinstance(e, dict) and e.get("clientId")]
+        if isinstance(data, dict):
+            # старый формат {clientId: {clientName...}} → нормализуем в массив
+            return [
+                {"clientId": cid, "userData": payload or {}}
+                for cid, payload in data.items()
+            ]
+        return []
+
+    async def upsert_clients_table_entry(self, public_key: str, name: str) -> None:
+        """Добавить/обновить имя пира в clientsTable (перечитывая файл перед записью).
+
+        Приложение перезаписывает таблицу целиком, поэтому каждый раз читаем
+        свежую версию и правим только свою запись.
+        """
+        entries = await self._load_clients_table_entries()
+        now = datetime.now(UTC).isoformat()
+        for entry in entries:
+            if entry.get("clientId") == public_key:
+                user_data = entry.setdefault("userData", {})
+                user_data["clientName"] = name
+                break
+        else:
+            entries.append({
+                "clientId": public_key,
+                "userData": {"clientName": name, "creationDate": now},
+            })
+        await self._write_clients_table(entries)
+
+    async def remove_clients_table_entry(self, public_key: str) -> None:
+        entries = await self._load_clients_table_entries()
+        remaining = [e for e in entries if e.get("clientId") != public_key]
+        if len(remaining) != len(entries):
+            await self._write_clients_table(remaining)
+
+    async def remove_external_peer(self, peer: dict[str, Any]) -> bool:
+        """Удалить внешний пир (добавленный не ботом): конфиг + ядро + clientsTable."""
+        public_key = peer.get("public_key")
+        if not public_key:
+            return False
+        try:
+            await self._kick_peer_from_kernel(public_key)
+            await self._remove_peer_from_config(public_key)
+            await self._sync_config()
+            await self.remove_clients_table_entry(public_key)
+            return True
+        except Exception as e:
+            logger.error("Не удалось удалить внешний AWG-пир {}: {}", public_key, e)
+            return False
 
     # ── Config generation ─────────────────────────────────────────────
 
@@ -322,6 +582,13 @@ class AmneziaAWGProvider(BaseVPNProvider):
         awg = self.server.awg_service
         if not awg:
             return {"config_type": "empty", "config_data": None}
+        if getattr(awg, "wipe_detected", False):
+            # Серверные ключи сменились — конфиг из БД мёртв, не отдаём его.
+            return {
+                "config_type": "empty",
+                "config_data": None,
+                "error": "wipe_detected",
+            }
 
         private_key = connection.private_key.strip() if connection.private_key else ""
         public_key = connection.public_key.strip() if connection.public_key else ""

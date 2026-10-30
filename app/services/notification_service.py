@@ -923,6 +923,122 @@ class NotificationService:
                 server_name, e, exc_info=True,
             )
 
+    async def notify_admins_awg_wipe(
+        self,
+        server_name: str,
+        mismatches: list[str],
+    ) -> None:
+        """Уведомить администраторов о переустановке AWG-контейнера извне.
+
+        Серверные ключи в контейнере сменились (например, нажали «Сохранить» в
+        настройках AWG официального приложения — оно делает docker rm -fv и
+        генерирует новые ключи). Все выданные конфиги мертвы до восстановления.
+
+        Args:
+            server_name: Имя сервера.
+            mismatches: Какие ключи разошлись (публичный ключ, HeaderProtectionKey).
+        """
+        settings = get_settings()
+        admin_ids = settings.admin_ids
+        if not admin_ids:
+            logger.warning("Нет admin_ids — пропуск уведомления об AWG wipe")
+            return
+
+        safe_server = html.escape(server_name)
+        what = ", ".join(html.escape(m) for m in mismatches)
+        message = (
+            f"🚨 <b>AWG-контейнер переустановлен извне</b>\n\n"
+            f"<b>Сервер:</b> {safe_server}\n"
+            f"<b>Расхождение:</b> {what}\n\n"
+            f"Серверные ключи сменились — все выданные клиентские конфиги "
+            f"недействительны. Выдача конфигов приостановлена.\n\n"
+            f"Восстановление: Серверы → AWG → «Восстановить после wipe»."
+        )
+
+        try:
+            bot = await self._get_bot()
+            for admin_id in admin_ids:
+                try:
+                    await bot.send_message(
+                        chat_id=admin_id, text=message, parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Не удалось уведомить администратора {} об AWG wipe: {}",
+                        admin_id, e,
+                    )
+        except Exception as e:
+            logger.error(
+                "Ошибка отправки уведомлений об AWG wipe (сервер {}): {}",
+                server_name, e, exc_info=True,
+            )
+
+    async def notify_admins_awg_external_peers(
+        self,
+        server_name: str,
+        new_peers: list[dict],
+        gone_public_keys: list[str],
+    ) -> None:
+        """Уведомить администраторов об изменениях среди внешних пиров AWG.
+
+        Внешние пиры — добавлены не ботом (обычно официальным клиентом Amnezia
+        поверх общего контейнера). Бот их не трогает — только информирует.
+
+        Args:
+            server_name: Имя сервера.
+            new_peers: Новые пиры (public_key, client_ip, name).
+            gone_public_keys: Pubkey исчезнувших внешних пиров.
+        """
+        settings = get_settings()
+        admin_ids = settings.admin_ids
+        if not admin_ids:
+            logger.warning("Нет admin_ids — пропуск уведомления о внешних пирax AWG")
+            return
+
+        if not new_peers and not gone_public_keys:
+            return
+
+        lines = []
+        for peer in new_peers[:10]:
+            name = html.escape(peer.get("name") or "без имени")
+            ip = html.escape(peer.get("client_ip") or "—")
+            lines.append(f"• {name} — <code>{ip}</code>")
+        if len(new_peers) > 10:
+            lines.append(f"• …ещё {len(new_peers) - 10}")
+
+        parts = []
+        if new_peers:
+            parts.append(
+                f"➕ <b>Новые внешние пиры ({len(new_peers)}):</b>\n" + "\n".join(lines)
+            )
+        if gone_public_keys:
+            parts.append(f"➖ <b>Исчезло внешних пиров:</b> {len(gone_public_keys)}")
+
+        message = (
+            f"👥 <b>Внешние пиры AmneziaWG</b>\n\n"
+            f"<b>Сервер:</b> {html.escape(server_name)}\n\n"
+            + "\n\n".join(parts)
+            + "\n\nУправление: Серверы → AWG → «Пиры контейнера»."
+        )
+
+        try:
+            bot = await self._get_bot()
+            for admin_id in admin_ids:
+                try:
+                    await bot.send_message(
+                        chat_id=admin_id, text=message, parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Не удалось уведомить администратора {} о внешних пирax AWG: {}",
+                        admin_id, e,
+                    )
+        except Exception as e:
+            logger.error(
+                "Ошибка отправки уведомлений о внешних пирax AWG (сервер {}): {}",
+                server_name, e, exc_info=True,
+            )
+
     # === Расхождения БД ↔ панель (governed reconcile) ===
 
     @staticmethod

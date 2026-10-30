@@ -18,6 +18,8 @@ Config dir on server: /opt/vpnbot/awg/
 
 import contextlib
 import random
+import re
+from typing import Any
 
 from loguru import logger
 
@@ -26,10 +28,58 @@ from app.services.installers.base import BASE_DIR, AlreadyInstalledError, BaseIn
 AWG_SERVICE_DIR = f"{BASE_DIR}/awg"
 AWG_CONTAINER_NAME = "awg"
 AWG_INTERFACE = "awg0"
+# Контейнеры AmneziaWG официального приложения (client/core/utils/containers/
+# containerUtils.cpp): amnezia-awg2 — актуальный (AWG 3.x, тулзы awg),
+# amnezia-awg — legacy (тулзы wg, конфиг wg0.conf).
+OFFICIAL_AWG_CONTAINERS = ("amnezia-awg2", "amnezia-awg")
+LEGACY_OFFICIAL_CONTAINER = "amnezia-awg"
+LEGACY_CONFIG_PATH = "/opt/amnezia/awg/wg0.conf"
+AWG_CONFIG_PATH = "/opt/amnezia/awg/awg0.conf"
 
 AWG_SUBNET_DEFAULT = "10.8.0.0"
 AWG_SUBNET_CIDR_DEFAULT = 24
 AWG_SUBNET_IP_DEFAULT = "10.8.0.1"
+
+
+def parse_awg_conf(config_text: str) -> dict:
+    """Разобрать [Interface]-секцию awg0.conf/wg0.conf (свой или app-контейнера).
+
+    Возвращает port, subnet_ip, subnet_cidr, obfuscation (включая
+    HeaderProtectionKey и закомментированные I1-I5), server_private_key и
+    protocol_version ("3.1" | "2" | "unknown") — эвристика как в
+    awgProtocolConfig.cpp:20-65 официального клиента.
+    """
+    port_match = re.search(r"ListenPort\s*=\s*(\d+)", config_text)
+    addr_match = re.search(r"Address\s*=\s*([\d.]+)/(\d+)", config_text)
+    pk_match = re.search(r"PrivateKey\s*=\s*(\S+)", config_text)
+
+    obfuscation: dict[str, str] = {}
+    for key in _OBF_KEYS:
+        m = re.search(rf"{key}\s*=\s*(.+)", config_text)
+        if m:
+            obfuscation[key] = m.group(1).strip()
+    for key in _I_KEYS:
+        m = re.search(rf"{key}\s*=\s*(.*)", config_text)
+        obfuscation[key] = m.group(1).strip() if m else ""
+    m = re.search(r"HeaderProtectionKey\s*=\s*(\S+)", config_text)
+    if m:
+        obfuscation["HeaderProtectionKey"] = m.group(1).strip()
+
+    if obfuscation.get("HeaderProtectionKey"):
+        protocol_version = "3.1"
+    elif obfuscation.get("S3") or obfuscation.get("S4"):
+        protocol_version = "2"
+    else:
+        protocol_version = "unknown"
+
+    return {
+        "port": int(port_match.group(1)) if port_match else None,
+        "subnet_ip": addr_match.group(1) if addr_match else None,
+        "subnet_cidr": int(addr_match.group(2)) if addr_match else None,
+        "obfuscation": obfuscation,
+        "server_private_key": pk_match.group(1).strip() if pk_match else "",
+        "protocol_version": protocol_version,
+    }
 
 
 I1_DEFAULT = "<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>"
@@ -43,6 +93,14 @@ V3_TIMING_DEFAULTS = {
     "KeepaliveTimeout": "5-15",
     "MaxHandshakeAttempts": "15-20",
 }
+
+# Читаемые из awg0.conf параметры обфускации (I1-I5 в конфиге закомментированы —
+# так их пишет и официальный клиент, парсим обе формы).
+_OBF_KEYS = (
+    "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4",
+    "RandomTrailers", "DisableCookies", *V3_TIMING_DEFAULTS,
+)
+_I_KEYS = ("I1", "I2", "I3", "I4", "I5")
 
 
 def generate_obfuscation_params() -> dict[str, str]:
@@ -121,47 +179,102 @@ class AWGInstaller(BaseInstaller):
 
     SERVICE_NAME = AWG_CONTAINER_NAME
 
-    async def discover_existing(self) -> dict:
-        """Read configs from an existing AWG installation.
+    async def _bot_managed_awg_names(self) -> set[str]:
+        """Имена AWG-контейнеров, установленных ботом (по метке vpnbot.service=awg).
+
+        Бот ставит метку в docker-compose; у контейнеров официального приложения
+        её нет. Имя контейнера признаком быть не может: бот может поставить
+        контейнер с именем amnezia-awg2, чтобы приложение его подобрало.
+        """
+        try:
+            result = await self._cmd(
+                "docker ps -a --filter label=vpnbot.service=awg --format '{{.Names}}'"
+            )
+        except Exception as e:
+            import asyncssh
+
+            if isinstance(e, (asyncssh.Error, OSError)) or "SSH" in str(e):
+                raise
+            return set()
+        return {n.strip() for n in result.strip().splitlines() if n.strip()}
+
+    async def list_awg_containers(self) -> list[dict[str, Any]]:
+        """Найти AWG-контейнеры на сервере: свои (по метке) и приложения.
+
+        Возвращает [{"name": ..., "external": bool}] — порядок приоритета:
+        свой контейнер первым, затем amnezia-awg2 (актуальный), amnezia-awg (legacy).
+        """
+        try:
+            result = await self._cmd("docker ps -a --format '{{.Names}}'")
+        except Exception as e:
+            import asyncssh
+
+            if isinstance(e, (asyncssh.Error, OSError)) or "SSH" in str(e):
+                raise
+            return []
+        names = {line.strip() for line in result.strip().splitlines() if line.strip()}
+        managed = await self._bot_managed_awg_names()
+
+        found: list[dict[str, Any]] = []
+        for name in (f"vpnbot-{AWG_CONTAINER_NAME}", *OFFICIAL_AWG_CONTAINERS):
+            if name in names:
+                found.append({"name": name, "external": name not in managed})
+        return found
+
+    async def check_already_installed(self) -> bool:
+        """AWG считается установленным, если есть любой AWG-контейнер."""
+        return bool(await self.list_awg_containers())
+
+    async def discover_existing(self, container_name: str = "vpnbot-awg") -> dict:
+        """Прочитать конфигурацию существующего AWG-контейнера через docker exec.
+
+        Работает и с контейнером приложения (у него нет volume — конфиг живёт
+        в ФС контейнера), и со своим vpnbot-awg.
 
         Returns dict with: port, subnet_ip, subnet_cidr, obfuscation,
-        server_public_key, server_private_key.
+        server_public_key, server_private_key, container_name, is_external,
+        protocol_version.
         """
-        import re
+        legacy = container_name == LEGACY_OFFICIAL_CONTAINER
+        config_path = LEGACY_CONFIG_PATH if legacy else AWG_CONFIG_PATH
+        tool = "wg" if legacy else "awg"
 
         async with self.ssh:
-            config = await self._cmd(f"cat {AWG_SERVICE_DIR}/data/awg0.conf")
+            def _dex(cmd: str, input_data: str | None = None) -> Any:
+                return self._cmd(
+                    f"docker exec -i {container_name} {cmd}", input_data=input_data
+                )
 
-            port_match = re.search(r"ListenPort\s*=\s*(\d+)", config)
-            addr_match = re.search(r"Address\s*=\s*([\d.]+)/(\d+)", config)
-            pk_match = re.search(r"PrivateKey\s*=\s*(\S+)", config)
-
-            obfuscation = {}
-            for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4",
-                        "RandomTrailers", "DisableCookies", *V3_TIMING_DEFAULTS):
-                m = re.search(rf"{key}\s*=\s*(.+)", config)
-                if m:
-                    obfuscation[key] = m.group(1).strip()
-            for key in ("I1", "I2", "I3", "I4", "I5"):
-                m = re.search(rf"{key}\s*=\s*(.*)", config)
-                obfuscation[key] = m.group(1).strip() if m else ""
-            m = re.search(r"HeaderProtectionKey\s*=\s*(\S+)", config)
-            if m:
-                obfuscation["HeaderProtectionKey"] = m.group(1).strip()
+            config = await _dex(f"cat {config_path}")
+            parsed = parse_awg_conf(config)
 
             public_key = ""
             with contextlib.suppress(Exception):
-                public_key = (await self._cmd(
-                    f"cat {AWG_SERVICE_DIR}/data/wireguard_server_public_key.key"
+                public_key = (await _dex(
+                    "cat /opt/amnezia/awg/wireguard_server_public_key.key"
                 )).strip()
+            if not public_key and parsed["server_private_key"]:
+                # Файла pubkey нет (или пуст) — выводим из приватного ключа.
+                with contextlib.suppress(Exception):
+                    public_key = (await _dex(
+                        f"sh -c '{tool} pubkey'",
+                        input_data=parsed["server_private_key"] + "\n",
+                    )).strip()
+
+            # Внешний = без метки бота: бот может ставить контейнер и с именем
+            # amnezia-awg2 (чтобы приложение его подобрало), имя не маркер.
+            managed = await self._bot_managed_awg_names()
 
         return {
-            "port": int(port_match.group(1)) if port_match else 51820,
-            "subnet_ip": addr_match.group(1) if addr_match else "10.8.0.1",
-            "subnet_cidr": int(addr_match.group(2)) if addr_match else 24,
-            "obfuscation": obfuscation if obfuscation else generate_obfuscation_params(),
+            "port": parsed["port"] or 51820,
+            "subnet_ip": parsed["subnet_ip"] or "10.8.0.1",
+            "subnet_cidr": parsed["subnet_cidr"] or 24,
+            "obfuscation": parsed["obfuscation"],
             "server_public_key": public_key,
-            "server_private_key": pk_match.group(1).strip() if pk_match else "",
+            "server_private_key": parsed["server_private_key"],
+            "container_name": container_name,
+            "is_external": container_name not in managed,
+            "protocol_version": parsed["protocol_version"],
         }
 
     async def install(
@@ -171,6 +284,7 @@ class AWGInstaller(BaseInstaller):
         subnet_cidr: int = AWG_SUBNET_CIDR_DEFAULT,
         obfuscation: dict[str, str] | None = None,
         force: bool = False,
+        container_name: str = f"vpnbot-{AWG_CONTAINER_NAME}",
     ) -> dict:
         """Install AmneziaWG on the server.
 
@@ -180,6 +294,10 @@ class AWGInstaller(BaseInstaller):
             subnet_cidr: Subnet CIDR mask (e.g. 24).
             obfuscation: AWG obfuscation params. Auto-generated if None.
             force: Remove existing container before installing.
+            container_name: Имя docker-контейнера. По умолчанию vpnbot-awg;
+                можно задать amnezia-awg2 — тогда официальный клиент Amnezia
+                подхватит контейнер при добавлении сервера (он ищет контейнеры
+                по этому имени, installController.cpp).
 
         Returns:
             Dict with installation details (port, subnet, obfuscation params).
@@ -195,21 +313,31 @@ class AWGInstaller(BaseInstaller):
         try:
             async with self.ssh:
                 logger.info(
-                    "Установка AWG на {}:{}, subnet={}/{}",
-                    self.ssh.host, port, subnet_ip, subnet_cidr,
+                    "Установка AWG на {}:{}, subnet={}/{}, container={}",
+                    self.ssh.host, port, subnet_ip, subnet_cidr, container_name,
                 )
 
                 await self._progress(1, 11, "Подготовка сервера (Docker, утилиты)...")
                 await self.prepare_host()
 
                 if await self.check_already_installed():
+                    existing = await self.list_awg_containers()
+                    existing_names = ", ".join(c["name"] for c in existing)
                     if force:
-                        logger.warning("Принудительная переустановка: удаляю vpnbot-awg на {}", self.ssh.host)
-                        await self._cmd("docker rm -f vpnbot-awg 2>/dev/null || true")
+                        # Удаляем только «свой» контейнер; внешние (приложения)
+                        # не трогаем — их переустановка стирает чужих пиров.
+                        logger.warning(
+                            "Принудительная переустановка: удаляю {} на {}",
+                            container_name, self.ssh.host,
+                        )
+                        await self._cmd(
+                            f"docker rm -f {container_name} 2>/dev/null || true"
+                        )
                         await self._cmd("sleep 2")
                     else:
                         raise AlreadyInstalledError(
-                            f"AmneziaWG уже установлен на {self.ssh.host}. "
+                            f"AmneziaWG уже установлен на {self.ssh.host} "
+                            f"(контейнер(ы): {existing_names}). "
                             "Для переустановки нажмите кнопку ниже."
                         )
 
@@ -235,7 +363,7 @@ class AWGInstaller(BaseInstaller):
                 await self._write_start_script(service_dir, subnet_ip, subnet_cidr)
 
                 await self._progress(6, 11, "Запись docker-compose.yml...")
-                await self._write_compose_file(service_dir, port)
+                await self._write_compose_file(service_dir, port, container_name)
 
                 await self._progress(7, 11, "Сборка Docker-образа (может занять 1-2 мин)...")
                 await self._build_image()
@@ -245,7 +373,7 @@ class AWGInstaller(BaseInstaller):
 
                 await self._progress(9, 11, "Генерация ключей и конфигурации...")
                 keys = await self._generate_keys_and_config(
-                    port, subnet_ip, subnet_cidr, obfuscation
+                    port, subnet_ip, subnet_cidr, obfuscation, container_name
                 )
                 obfuscation = {
                     **obfuscation,
@@ -253,14 +381,14 @@ class AWGInstaller(BaseInstaller):
                 }
 
                 await self._progress(10, 11, "Перезапуск с конфигурацией...")
-                await self._restart_container()
+                await self._restart_container(container_name)
 
                 await self._progress(11, 11, "Установка завершена")
 
-                logger.info("AWG установлен на {}:{}", self.ssh.host, port)
+                logger.info("AWG установлен на {}:{} (контейнер {})", self.ssh.host, port, container_name)
 
                 return {
-                    "container_name": f"vpnbot-{AWG_CONTAINER_NAME}",
+                    "container_name": container_name,
                     "port": port,
                     "subnet_ip": subnet_ip,
                     "subnet_cidr": subnet_cidr,
@@ -320,11 +448,13 @@ tail -f /dev/null
 """
         await self._write_file(f"{service_dir}/start.sh", script)
 
-    async def _write_compose_file(self, service_dir: str, port: int) -> None:
+    async def _write_compose_file(
+        self, service_dir: str, port: int, container_name: str
+    ) -> None:
         compose = f"""services:
   awg:
     build: {service_dir}
-    container_name: vpnbot-awg
+    container_name: {container_name}
     restart: unless-stopped
     entrypoint: ["/opt/amnezia/start.sh"]
     privileged: true
@@ -356,8 +486,9 @@ tail -f /dev/null
         subnet_ip: str,
         subnet_cidr: int,
         obfuscation: dict[str, str],
+        container_name: str = f"vpnbot-{AWG_CONTAINER_NAME}",
     ) -> dict[str, str]:
-        name = f"vpnbot-{AWG_CONTAINER_NAME}"
+        name = container_name
 
         private_key = await self._cmd(
             f"docker exec -i {name} awg genkey"
@@ -405,7 +536,8 @@ tail -f /dev/null
             "header_protection_key": header_protection_key,
         }
 
-    async def _restart_container(self) -> None:
-        name = f"vpnbot-{AWG_CONTAINER_NAME}"
-        await self._cmd(f"docker restart {name}")
+    async def _restart_container(
+        self, container_name: str = f"vpnbot-{AWG_CONTAINER_NAME}"
+    ) -> None:
+        await self._cmd(f"docker restart {container_name}")
         await self._cmd("sleep 3")
