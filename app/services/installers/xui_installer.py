@@ -384,6 +384,10 @@ class XUIInstaller(BaseInstaller):
 
         await self._cmd(f"docker exec -i {name} apk add --no-cache sqlite")
 
+        # x-ui при первом старте недолго держит SQLite-лок (миграции/инициализация):
+        # без busy-timeout правки падают с "database is locked".
+        sqlite_cmd = f"docker exec -i {name} sqlite3 -cmd '.timeout 15000' {db_path}"
+
         sql_del = (
             "DELETE FROM settings WHERE key IN "
             "('webBasePath', 'subPath', 'subJsonPath', "
@@ -391,7 +395,7 @@ class XUIInstaller(BaseInstaller):
             "'webPort', 'subPort')"
         )
         await self._cmd(
-            f"docker exec -i {name} sqlite3 {db_path}",
+            sqlite_cmd,
             input_data=sql_del,
         )
 
@@ -408,7 +412,7 @@ class XUIInstaller(BaseInstaller):
             f"('subPort', '{XUI_SUB_PORT}')"
         )
         await self._cmd(
-            f"docker exec -i {name} sqlite3 {db_path}",
+            sqlite_cmd,
             input_data=sql_ins,
         )
 
@@ -418,7 +422,7 @@ class XUIInstaller(BaseInstaller):
             f"WHERE id=1"
         )
         await self._cmd(
-            f"docker exec -i {name} sqlite3 {db_path}",
+            sqlite_cmd,
             input_data=sql_user,
         )
 
@@ -442,11 +446,14 @@ class XUIInstaller(BaseInstaller):
         logger.info("Панель доступна через внутренний порт: HTTP {}", code)
 
         caddy_url = f"https://{domain}:{caddy_port}/{clean_web}/" if clean_web else f"https://{domain}:{caddy_port}/"
+        # TLS у Caddy может ещё не подняться: сертификат ACME выдаётся асинхронно
+        # (и временно упирается в rate-limit Let's Encrypt). Это не ошибка
+        # установки — панель доступна, Caddy доберёт сертификат ретраями.
         caddy_result = await self._cmd(
-            f"curl -sk -o /dev/null -w '%{{http_code}}' {caddy_url}"
+            f"curl -sk -o /dev/null -w '%{{http_code}}' {caddy_url} 2>/dev/null || echo no-tls-yet"
         )
         caddy_code = caddy_result.strip().strip("'")
-        logger.info("Caddy-прокси доступен: HTTP {} ({})", caddy_code, caddy_url)
+        logger.info("Caddy-прокси: {} ({})", caddy_code, caddy_url)
 
     @staticmethod
     def _hash_password_bcrypt(password: str) -> str:
