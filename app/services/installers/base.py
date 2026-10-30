@@ -106,7 +106,7 @@ class BaseInstaller:
             await self.ssh.write_file(filepath, content)
 
     async def preflight_check(self) -> tuple[bool, str]:
-        """Run pre-installation checks: ping + SSH + root/sudo access.
+        """Run pre-installation checks: TCP probe + SSH + root/sudo access.
 
         Returns:
             Tuple of (success: bool, message: str).
@@ -114,14 +114,17 @@ class BaseInstaller:
         from app.services.server_monitor import ServerMonitor
 
         host = self.ssh.host
+        port = self.ssh.port or 22
 
-        ping_ok = await ServerMonitor.ping(host)
-        if not ping_ok:
-            return False, f"Сервер {host} не отвечает на ping"
+        # TCP-проба того же порта, на который пойдёт SSH (ICMP хостеры часто
+        # режут — проба на нём ломала установку на живых серверах).
+        tcp_ok = await ServerMonitor.check_tcp(host, port)
+        if not tcp_ok:
+            return False, f"Сервер {host}:{port} недоступен (TCP-проба)"
 
         ssh_ok = await self.ssh.test_connection()
         if not ssh_ok:
-            return False, f"Не удалось подключиться по SSH к {host}:{self.ssh.port}. Проверьте логин/пароль/ключ."
+            return False, f"Не удалось подключиться по SSH к {host}:{port}. Проверьте логин/пароль/ключ."
 
         root_ok, root_msg = await self._check_root_access()
         if not root_ok:

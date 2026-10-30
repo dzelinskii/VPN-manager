@@ -929,7 +929,7 @@ class TestTransactionBoundaries:
                 new=AsyncMock(side_effect=RuntimeError("boom")),
             ),
             patch.object(svc, "_save_server_error_status", new=AsyncMock()),
-            patch("app.services.server_monitor.ServerMonitor.ping", new=AsyncMock(return_value=True)),
+            patch("app.services.server_monitor.ServerMonitor.check_tcp", new=AsyncMock(return_value=True)),
         ):
             # Мокируем session.execute для запроса inbounds
             session.execute = AsyncMock(return_value=_make_scalars_result([]))
@@ -965,7 +965,7 @@ class TestTransactionBoundaries:
             patch.object(svc, "_needs_sync", return_value=True),
             patch.object(svc, "_sync_server_inbounds", new=AsyncMock()),
             patch.object(svc, "_reconcile_xui_server", new=reconcile_mock),
-            patch("app.services.server_monitor.ServerMonitor.ping", new=AsyncMock(return_value=True)),
+            patch("app.services.server_monitor.ServerMonitor.check_tcp", new=AsyncMock(return_value=True)),
         ):
             session.execute = AsyncMock(return_value=_make_scalars_result([]))
 
@@ -1006,7 +1006,7 @@ class TestTransactionBoundaries:
                 new=AsyncMock(side_effect=XUIError("panel error")),
             ),
             patch.object(svc, "_save_server_error_status", new=save_status_mock),
-            patch("app.services.server_monitor.ServerMonitor.ping", new=AsyncMock(return_value=True)),
+            patch("app.services.server_monitor.ServerMonitor.check_tcp", new=AsyncMock(return_value=True)),
         ):
             session.execute = AsyncMock(return_value=_make_scalars_result([]))
 

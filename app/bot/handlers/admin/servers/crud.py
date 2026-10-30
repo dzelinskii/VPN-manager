@@ -108,62 +108,14 @@ async def process_server_ip_address(message: TgMessage, state: FSMContext) -> No
 
     await state.update_data(ip_address=ip_address)
 
-    msg = await message.answer(t("admin.servers.pinging", "🔄 Пингую сервер..."))
-
-    from app.services.server_monitor import ServerMonitor
-
-    is_online = await ServerMonitor.ping(ip_address)
-
-    if not is_online:
-        await state.set_state(ServerManagement.confirm_add_offline)
-
-        from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-        kb = InlineKeyboardBuilder()
-        kb.button(
-            text=t("admin.servers.buttons.add_offline_yes", "✅ Да, добавить"),
-            callback_data="add_offline_yes",
-        )
-        kb.button(
-            text=t("admin.servers.buttons.add_offline_no", "❌ Нет, отменить"),
-            callback_data="add_offline_no",
-        )
-        kb.adjust(1)
-
-        await msg.edit_text(
-            t(
-                "admin.servers.errors.server_offline",
-                "⚠️ Сервер не отвечает на ping.\nВы уверены, что хотите добавить его?",
-            ),
-            reply_markup=kb.as_markup(),
-        )
-        return
-
-    # Online, proceed to create
-    await _create_and_finish_server_addition(msg, state, ip_address, True)
-
-
-@router.callback_query(ServerManagement.confirm_add_offline)
-async def process_confirm_add_offline(callback: CallbackQuery, state: FSMContext) -> None:
-    """Process confirmation to add offline server."""
-    if callback.data == "add_offline_no":
-        await state.clear()
-        await callback.message.edit_text(
-            t("admin.servers.add_cancelled", "❌ Добавление сервера отменено."),
-            reply_markup=get_back_keyboard("admin_servers"),
-        )
-        await callback.answer()
-        return
-
-    # Proceed to create
-    data = await state.get_data()
-    ip_address = data.get("ip_address")
-    await _create_and_finish_server_addition(callback.message, state, ip_address, False)
-    await callback.answer()
+    # Доступность здесь не проверяем: SSH-порт станет известен позже.
+    # Настоящая проверка — test_connection при вводе SSH-кредов (порт из
+    # настроек) и preflight перед установками (TCP-проба того же порта).
+    await _create_and_finish_server_addition(message, state, ip_address)
 
 
 async def _create_and_finish_server_addition(
-    message: TgMessage, state: FSMContext, ip_address: str, is_online: bool
+    message: TgMessage, state: FSMContext, ip_address: str
 ) -> None:
     """Helper to create server and notify admin."""
     data = await state.get_data()
@@ -178,7 +130,8 @@ async def _create_and_finish_server_addition(
             username=None,
             password=None,
         )
-        server.is_online = is_online
+        # is_online выяснит первый синк-цикл (TCP-проба SSH-порта)
+        server.is_online = False
         await session.commit()
 
     await state.clear()

@@ -216,7 +216,7 @@ class SyncService:
 
             logger.info("Синхронизация сервера {}", server.name)
 
-            # Ping the server to update its online status
+            # TCP-проба SSH-порта сервера для обновления статуса online
             if server.ip_address:
                 from app.services.server_monitor import ServerMonitor
                 host = server.ip_address
@@ -226,9 +226,13 @@ class SyncService:
                     host = host[8:]
                 if ":" in host:
                     host = host.split(":")[0]
-                is_online = await ServerMonitor.ping(host)
+                probe_port = server.ssh_port or 22
+                is_online = await ServerMonitor.check_tcp(host, probe_port)
                 server.is_online = is_online
-                logger.debug("Ping {}: {}", server.name, "доступен" if is_online else "недоступен")
+                logger.debug(
+                    "TCP-проба {}:{}: {}",
+                    host, probe_port, "доступен" if is_online else "недоступен",
+                )
 
             xui_client = None
             if server.is_online and server.xui_panel and server.xui_panel.url and server.xui_panel.username:
