@@ -38,7 +38,6 @@
   "callback_query:mtproxy_install_new": 1,
   "callback_query:mtproxy_port_auto": 1,
   "callback_query:mtproxy_reinstall": 1,
-  "callback_query:process_confirm_add_offline": 1,
   "callback_query:run_server_autodiscover": 1,
   "callback_query:select_server": 1,
   "callback_query:show_inbound_stats": 1,

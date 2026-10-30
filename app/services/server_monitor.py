@@ -1,7 +1,7 @@
-"""Server monitor service for pinging and checking host availability."""
+"""Server monitor service for checking host availability via TCP probe."""
 
 import asyncio
-import platform
+import contextlib
 
 from loguru import logger
 
@@ -10,47 +10,43 @@ from app.database.models import Server
 
 
 class ServerMonitor:
-    """Service to periodically check server availability via ICMP ping."""
+    """Checks server availability via TCP connect to the configured SSH port.
+
+    ICMP-пинг не подходит: хостеры часто режут echo-request на сетевом уровне
+    (например, правилом iptables перед цепочками UFW), из-за чего бот отказывался
+    подключаться по SSH к живому серверу. TCP-подключение к SSH-порту — честный
+    сигнал «SSH-служба доступна», без subprocess и платформенных веток.
+    """
 
     @staticmethod
-    async def ping(host: str, timeout: int = 2) -> bool:
-        """Check if a host is reachable via ping.
+    async def check_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
+        """Check if a TCP port is accepting connections.
 
         Args:
-            host: IP address or domain name
-            timeout: Timeout in seconds
+            host: IP address or domain name.
+            port: TCP port (SSH port of the server).
+            timeout: Timeout in seconds.
 
         Returns:
-            True if reachable, False otherwise
+            True if the connection is accepted, False otherwise
+            (timeout, connection refused, DNS failure, etc.).
         """
-        # Determine the correct ping command parameters based on OS
-        param_count = "-n" if platform.system().lower() == "windows" else "-c"
-        param_timeout = "-w" if platform.system().lower() == "windows" else "-W"
-
-        # Windows ping -w is in milliseconds, Linux -W is in seconds or depends on implementation.
-        # Usually -W 2 on Linux, and -w 2000 on Windows
-        timeout_val = (
-            str(timeout * 1000) if platform.system().lower() == "windows" else str(timeout)
-        )
-
-        command = ["ping", param_count, "1", param_timeout, timeout_val, host]
-
         try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout
             )
-
-            await process.communicate()
-            return process.returncode == 0
         except Exception as e:
-            logger.error("Ping не удался для хоста {}: {}", host, e)
+            logger.debug("TCP-проба {}:{} не удалась: {}", host, port, e)
             return False
+
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
+        return True
 
     @classmethod
     async def check_server_status(cls, server_id: int) -> bool:
-        """Ping a specific server and update its status in DB.
+        """Probe a specific server and update its status in DB.
 
         Args:
             server_id: Server model ID
@@ -80,7 +76,7 @@ class ServerMonitor:
             if not host:
                 return False
 
-            is_online = await cls.ping(host)
+            is_online = await cls.check_tcp(host, server.ssh_port or 22)
 
             # Update DB if status changed
             if server.is_online != is_online:

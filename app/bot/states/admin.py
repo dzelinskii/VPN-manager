@@ -8,7 +8,6 @@ class ServerManagement(StatesGroup):
 
     waiting_for_name = State()
     waiting_for_ip_address = State()
-    confirm_add_offline = State()
 
     # SSH setup flow
     waiting_for_ssh_port = State()

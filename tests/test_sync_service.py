@@ -280,7 +280,7 @@ async def test_sync_cycle_survives_failing_xui_server(test_session, mock_setting
 
     service = SyncService(test_session)
     # Сервер «онлайн», но XUI-клиент падает с XUIError (как при невалидном токене + пустом пароле).
-    monkeypatch.setattr(ServerMonitor, "ping", AsyncMock(return_value=True))
+    monkeypatch.setattr(ServerMonitor, "check_tcp", AsyncMock(return_value=True))
     monkeypatch.setattr(
         service._xui_service,
         "_get_client",
