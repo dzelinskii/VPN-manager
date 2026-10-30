@@ -76,6 +76,9 @@ def _build_provider(obfuscation: dict | None = None):
     awg.subnet_ip = "10.8.0.0"
     awg.subnet_cidr = 24
     awg.server_public_key = "sErVeRpUbLiCkEy1234567890abcdefghijklmn="
+    awg.container_name = "vpnbot-awg"
+    awg.is_external = False
+    awg.wipe_detected = False
 
     server = MagicMock()
     server.ip_address = "203.0.113.10"

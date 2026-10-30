@@ -200,6 +200,8 @@ async def run_server_autodiscover(
 
         if "amnezia-awg" in discovered:
             details = discovered["amnezia-awg"]
+            container_name = details.get("container_name", "vpnbot-awg")
+            is_external = details.get("is_external", False)
             if not server.awg_service:
                 awg = AWGService(
                     server_id=server.id,
@@ -207,10 +209,18 @@ async def run_server_autodiscover(
                     subnet_ip=details.get("subnet_ip", "10.8.0.1"),
                     subnet_cidr=details.get("subnet_cidr", 24),
                     obfuscation=details.get("obfuscation", {}),
+                    container_name=container_name,
+                    is_external=is_external,
+                    server_public_key=details.get("server_public_key") or None,
+                    server_private_key=details.get("server_private_key") or None,
                 )
                 session.add(awg)
+                origin = (
+                    "контейнер приложения, переустановка запрещена"
+                    if is_external else "контейнер бота"
+                )
                 discovered_list.append(
-                    f"AmneziaWG (порт {details.get('port', 51820)})"
+                    f"AmneziaWG {container_name} — {origin} (порт {details.get('port', 51820)})"
                 )
             else:
                 discovered_list.append("AmneziaWG (уже подключён)")

@@ -15,15 +15,19 @@ from app.services.ssh_service import SSHManager
 class AutoDiscoveryService:
     """Discovers installed VPN services on a remote server."""
 
+    # AWG-контейнеры, которые умеем обнаруживать: свой + контейнеры
+    # официального приложения Amnezia (docs/amnezia-awg-parallel-management.md).
+    AWG_CONTAINER_NAMES = ("vpnbot-awg", "amnezia-awg2", "amnezia-awg")
+
     def __init__(self, server: Server) -> None:
         self.server = server
         self.ssh = SSHManager(server)
 
-    async def _vpnbot_containers(self) -> list[str]:
-        """List all vpnbot-* container names on the server."""
+    async def _all_containers(self) -> list[str]:
+        """List all container names on the server (sudo-first, like before)."""
         try:
             output = await self.ssh.run_command(
-                "sudo -n docker ps -a --filter name=vpnbot- --format '{{.Names}}' 2>/dev/null || docker ps -a --filter name=vpnbot- --format '{{.Names}}'"
+                "sudo -n docker ps -a --format '{{.Names}}' 2>/dev/null || docker ps -a --format '{{.Names}}'"
             )
             return [name.strip() for name in output.strip().split("\n") if name.strip()]
         except Exception:
@@ -43,7 +47,7 @@ class AutoDiscoveryService:
             }
         """
         async with self.ssh:
-            containers = await self._vpnbot_containers()
+            containers = await self._all_containers()
             if not containers:
                 return {}
 
@@ -54,8 +58,11 @@ class AutoDiscoveryService:
                 if details:
                     discovered["3x-ui"] = details
 
-            if "vpnbot-awg" in containers:
-                details = await self.discover_amnezia_awg()
+            awg_container = next(
+                (c for c in self.AWG_CONTAINER_NAMES if c in containers), None
+            )
+            if awg_container:
+                details = await self.discover_amnezia_awg(awg_container)
                 if details:
                     discovered["amnezia-awg"] = details
 
@@ -77,13 +84,19 @@ class AutoDiscoveryService:
             logger.debug("XUI discovery не удался на сервере {}: {}", self.server.id, e)
             return None
 
-    async def discover_amnezia_awg(self) -> dict[str, Any] | None:
-        """Discover AmneziaWG installation via AWGInstaller.discover_existing()."""
+    async def discover_amnezia_awg(
+        self, container_name: str = "vpnbot-awg"
+    ) -> dict[str, Any] | None:
+        """Discover AmneziaWG installation via AWGInstaller.discover_existing().
+
+        container_name позволяет прочитать и контейнер официального приложения
+        (amnezia-awg2/amnezia-awg) — у него конфиг лежит в ФС контейнера.
+        """
         try:
             from app.services.installers.awg_installer import AWGInstaller
 
             installer = AWGInstaller(self.ssh)
-            return await installer.discover_existing()
+            return await installer.discover_existing(container_name)
         except Exception as e:
             logger.debug("AWG discovery не удался на сервере {}: {}", self.server.id, e)
             return None

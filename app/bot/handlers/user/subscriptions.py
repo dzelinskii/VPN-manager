@@ -961,6 +961,16 @@ async def download_file_config(callback: CallbackQuery, client) -> None:
         try:
             config = await provider.get_client_config(conn.inbound, conn)
 
+            if config.get("error") == "wipe_detected":
+                await callback.message.answer(
+                    t(
+                        "user.subs.wipe_detected",
+                        "⚠️ Конфиг временно недоступен: сервер AmneziaWG переустанавливается. "
+                        "Обратитесь к администратору.",
+                    )
+                )
+                return
+
             if config.get("config_data"):
                 from aiogram.types import BufferedInputFile
 
@@ -982,6 +992,34 @@ async def download_file_config(callback: CallbackQuery, client) -> None:
                             remark=display_remark,
                         ),
                     )
+
+                    # QR нативного .conf — так же экспортирует официальный клиент
+                    # Amnezia (Share → конфиг): телефон сканирует и подключается.
+                    try:
+                        import io
+
+                        import qrcode
+
+                        qr = qrcode.QRCode(version=1, box_size=10, border=4)
+                        qr.add_data(config_data)
+                        qr.make(fit=True)
+                        img = qr.make_image(fill_color="black", back_color="white")
+
+                        bio = io.BytesIO()
+                        img.save(bio, "PNG")
+                        bio.seek(0)
+
+                        photo = BufferedInputFile(bio.getvalue(), filename="qr.png")
+                        await callback.message.answer_photo(
+                            photo=photo,
+                            caption=t(
+                                "user.subs.qr_caption",
+                                "📱 QR-код для {remark}",
+                                remark=display_remark,
+                            ),
+                        )
+                    except Exception as qr_err:
+                        logger.warning("Не удалось сгенерировать QR: {}", qr_err)
 
                 else:
                     # Send as link message
@@ -1005,25 +1043,6 @@ async def download_file_config(callback: CallbackQuery, client) -> None:
                             ),
                             parse_mode="HTML",
                         )
-
-                # Generate and send QR code for both link and file
-                # TODO: Раскомментировать, когда появится поддержка QR-кодов в клиенте Amnezia
-                # qr = qrcode.QRCode(version=1, box_size=10, border=4)
-                # qr.add_data(config_data)
-                # qr.make(fit=True)
-                # img = qr.make_image(fill_color="black", back_color="white")
-
-                # bio = io.BytesIO()
-                # img.save(bio, "PNG")
-                # bio.seek(0)
-
-                # photo = BufferedInputFile(bio.getvalue(), filename="qr.png")
-                # await callback.message.answer_photo(
-                #     photo=photo,
-                #     caption=t(
-                #         "user.subs.qr_caption", "📱 QR-код для {remark}", remark=conn.inbound.remark
-                #     ),
-                # )
 
         except Exception as e:
             from loguru import logger

@@ -103,6 +103,24 @@ class AWGService(Base, TimestampMixin):
         else:
             self._server_private_key_encrypted = encrypt_password(value)
 
+    # Интероп с официальным клиентом Amnezia
+    # (docs/amnezia-awg-parallel-management.md): container_name — имя docker-контейнера
+    # (свой vpnbot-awg или внешний amnezia-awg2/amnezia-awg приложения); is_external —
+    # контейнер установлен не ботом (переустановка из бота запрещена — она стирает
+    # чужих пиров); wipe_detected — серверные ключи на сервере сменились (контейнер
+    # переустановили извне), выдача конфигов блокируется до восстановления;
+    # external_peers_seen — pubkey'и внешних пиров, о которых админ уже уведомлён.
+    container_name: Mapped[str] = mapped_column(
+        String(100), nullable=False, default="vpnbot-awg", server_default="vpnbot-awg"
+    )
+    is_external: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    wipe_detected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    external_peers_seen: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
 
 class MTProxyService(Base, TimestampMixin):
     """MTProxy service configuration."""

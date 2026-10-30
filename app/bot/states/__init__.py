@@ -2,6 +2,7 @@
 
 from app.bot.states.admin import (
     AWGInstall,
+    AWGPeers,
     BroadcastManagement,
     ClientManagement,
     ExportData,
@@ -16,6 +17,7 @@ from app.bot.states.user import UserSubscription
 
 __all__ = [
     "AWGInstall",
+    "AWGPeers",
     "BroadcastManagement",
     "ClientManagement",
     "ExportData",

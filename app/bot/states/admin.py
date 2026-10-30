@@ -193,7 +193,14 @@ class AWGInstall(StatesGroup):
     waiting_for_port = State()
     waiting_for_obfuscation_mode = State()
     waiting_for_obfuscation_params = State()
+    waiting_for_container_name = State()
     confirm_install = State()
+
+
+class AWGPeers(StatesGroup):
+    """AWG external peers management states."""
+
+    waiting_for_rename = State()
 
 
 class XUIInstall(StatesGroup):

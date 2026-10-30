@@ -7,7 +7,7 @@ from aiogram.types import Message as TgMessage
 from loguru import logger
 
 from app.bot.keyboards import get_back_keyboard
-from app.bot.states import AWGInstall
+from app.bot.states import AWGInstall, AWGPeers
 from app.database import async_session_factory
 from app.utils.texts import t
 
@@ -76,7 +76,34 @@ async def edit_awg_service(callback: CallbackQuery) -> None:
         await msg.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
         return
 
-    await msg.edit_text("Меню управления AWG (в разработке).", reply_markup=get_back_keyboard(f"server_services_{server_id}"))
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.utils.text_decorations import html_decoration
+
+    awg = server.awg_service
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👥 Пиры контейнера", callback_data=f"awg_peers_{server_id}")
+    if awg.wipe_detected:
+        kb.button(text="🔧 Восстановить после wipe", callback_data=f"awg_wipe_recover_{server_id}")
+    kb.button(text="🔙 Назад", callback_data=f"server_services_{server_id}")
+    kb.adjust(1)
+
+    origin = (
+        "установлен официальным приложением Amnezia"
+        if awg.is_external else "установлен ботом"
+    )
+    wipe_line = (
+        "\n🚨 <b>Обнаружен wipe:</b> серверные ключи сменились — контейнер "
+        "переустановили извне. Выдача конфигов приостановлена."
+        if awg.wipe_detected else ""
+    )
+    await msg.edit_text(
+        "🛡 <b>AmneziaWG</b>\n\n"
+        f"Контейнер: <code>{html_decoration.quote(awg.container_name)}</code> ({origin})\n"
+        f"Порт: <code>{awg.port}/udp</code>"
+        f"{wipe_line}",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+    )
 
 @router.callback_query(F.data.startswith("server_install_awg_"))
 async def start_awg_install(callback: CallbackQuery, state: FSMContext) -> None:
@@ -138,9 +165,11 @@ async def start_awg_install(callback: CallbackQuery, state: FSMContext) -> None:
     if await installer.check_already_installed():
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+        containers = await installer.list_awg_containers()
+        names = ", ".join(f"<code>{c['name']}</code>" for c in containers) or "—"
         await status_msg.edit_text(
             "🔍 <b>AmneziaWG уже установлен на этом сервере</b>\n\n"
-            "Обнаружен контейнер <code>vpnbot-awg</code>.",
+            f"Обнаружен(ы) контейнер(ы): {names}.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text="🔌 Подключить",
@@ -205,11 +234,11 @@ async def awg_install_new(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("awg_connect_existing_"))
 async def awg_connect_existing(callback: CallbackQuery, state: FSMContext) -> None:
-    """Connect existing AWG — auto-discover params and save to DB."""
+    """Connect existing AWG — offer container choice, then auto-discover params."""
     server_id = int(callback.data.split("_")[-1])
 
     msg = await callback.message.edit_text(
-        "🔍 <b>Читаю конфигурацию AmneziaWG с сервера...</b>",
+        "🔍 <b>Ищу AmneziaWG-контейнеры на сервере...</b>",
         parse_mode="HTML",
     )
     await callback.answer()
@@ -235,7 +264,84 @@ async def awg_connect_existing(callback: CallbackQuery, state: FSMContext) -> No
             await msg.edit_text(f"❌ Ошибка проверки прав SSH:\n<code>{err_msg}</code>", reply_markup=get_back_keyboard(f"server_services_{server_id}"), parse_mode="HTML")
             return
 
-        params = await installer.discover_existing()
+        async with ssh:
+            containers = await installer.list_awg_containers()
+    except Exception as e:
+        logger.error("Ошибка поиска AWG-контейнеров: {}", e, exc_info=True)
+        await msg.edit_text(
+            f"❌ <b>Не удалось проверить сервер</b>\n\n<code>{e}</code>",
+            reply_markup=get_back_keyboard(f"server_services_{server_id}"),
+            parse_mode="HTML",
+        )
+        return
+
+    if not containers:
+        await msg.edit_text(
+            "❌ <b>AWG-контейнеры не найдены</b>\n\n"
+            "Ищу контейнеры <code>vpnbot-awg</code>, <code>amnezia-awg2</code> и "
+            "<code>amnezia-awg</code>. Установите AmneziaWG или подключите позже.",
+            reply_markup=get_back_keyboard(f"server_services_{server_id}"),
+            parse_mode="HTML",
+        )
+        return
+
+    if len(containers) == 1:
+        await _awg_discover_and_show(msg, state, server_id, containers[0]["name"])
+        return
+
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    rows = []
+    for c in containers:
+        label = c["name"] + (" (офф. клиент)" if c["external"] else "")
+        rows.append([InlineKeyboardButton(
+            text=f"🔌 {label}",
+            callback_data=f"awg_pick_container_{server_id}_{c['name']}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="🔙 Назад", callback_data=f"server_services_{server_id}",
+    )])
+    await msg.edit_text(
+        "🛡 <b>Найдено несколько AWG-контейнеров</b>\n\n"
+        "Какой подключить к боту?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("awg_pick_container_"))
+async def awg_pick_container(callback: CallbackQuery, state: FSMContext) -> None:
+    """Container chosen — discover its config and show connection confirmation."""
+    parts = callback.data.split("_")
+    server_id = int(parts[3])
+    container_name = parts[4]
+    await callback.answer()
+    await _awg_discover_and_show(callback.message, state, server_id, container_name)
+
+
+async def _awg_discover_and_show(msg, state: FSMContext, server_id: int, container_name: str) -> None:
+    """Discover AWG config inside the chosen container and ask for confirmation."""
+    await msg.edit_text(
+        f"🔍 <b>Читаю конфигурацию из контейнера</b> <code>{container_name}</code>...",
+        parse_mode="HTML",
+    )
+
+    try:
+        from app.services.installers.awg_installer import AWGInstaller
+        from app.services.ssh_service import SSHManager
+
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+
+            from app.database.models import Server
+
+            server = (await session.execute(
+                select(Server).where(Server.id == server_id)
+            )).scalar_one()
+
+        ssh = SSHManager(server)
+        installer = AWGInstaller(ssh)
+        params = await installer.discover_existing(container_name)
     except Exception as e:
         logger.error("Ошибка авто-обнаружения AWG: {}", e, exc_info=True)
         await msg.edit_text(
@@ -252,10 +358,22 @@ async def awg_connect_existing(callback: CallbackQuery, state: FSMContext) -> No
         f"  {k} = {html_decoration.quote(v)}"
         for k, v in params["obfuscation"].items()
     )
+    version_note = (
+        f"\n\nВерсия протокола: <code>{params['protocol_version']}</code>"
+        if params.get("protocol_version") and params["protocol_version"] != "unknown"
+        else ""
+    )
+    origin_note = (
+        "\n\nℹ️ Контейнер официального приложения: пиры, добавленные в нём из "
+        "приложения, бот будет видеть и уведомлять об изменениях."
+        if params.get("is_external") else ""
+    )
     await msg.edit_text(
-        "🛡 <b>AmneziaWG найден!</b> Параметры из awg0.conf:\n\n"
+        "🛡 <b>AmneziaWG найден!</b> Параметры из живого конфига контейнера:\n\n"
+        f"Контейнер: <code>{html_decoration.quote(container_name)}</code>\n"
         f"Порт: <code>{params['port']}/udp</code>\n"
-        f"Подсеть: <code>{params['subnet_ip']}/{params['subnet_cidr']}</code>\n\n"
+        f"Подсеть: <code>{params['subnet_ip']}/{params['subnet_cidr']}</code>"
+        f"{version_note}{origin_note}\n\n"
         f"<b>Обфускация:</b>\n{obf_text}\n\n"
         "Подключить с этими параметрами?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -273,6 +391,8 @@ async def awg_connect_existing(callback: CallbackQuery, state: FSMContext) -> No
     await state.update_data(
         server_id=server_id,
         connect_existing=True,
+        container_name=container_name,
+        is_external=params.get("is_external", False),
         port=params["port"],
         obfuscation=params["obfuscation"],
         subnet_ip=params["subnet_ip"],
@@ -293,6 +413,8 @@ async def awg_confirm_connect(callback: CallbackQuery, state: FSMContext) -> Non
     obf = data["obfuscation"]
     subnet_ip = data.get("subnet_ip", "10.8.0.1")
     subnet_cidr = data.get("subnet_cidr", 24)
+    container_name = data.get("container_name", "vpnbot-awg")
+    is_external = data.get("is_external", False)
     await state.clear()
 
     try:
@@ -316,6 +438,10 @@ async def awg_confirm_connect(callback: CallbackQuery, state: FSMContext) -> Non
                 existing.subnet_ip = subnet_ip
                 existing.subnet_cidr = subnet_cidr
                 existing.obfuscation = obf
+                existing.container_name = container_name
+                existing.is_external = is_external
+                existing.wipe_detected = False
+                existing.external_peers_seen = []
                 if data.get("server_public_key"):
                     existing.server_public_key = data["server_public_key"]
                 if data.get("server_private_key"):
@@ -327,6 +453,8 @@ async def awg_confirm_connect(callback: CallbackQuery, state: FSMContext) -> Non
                     subnet_ip=subnet_ip,
                     subnet_cidr=subnet_cidr,
                     obfuscation=obf,
+                    container_name=container_name,
+                    is_external=is_external,
                     server_public_key=data.get("server_public_key"),
                     server_private_key=data.get("server_private_key"),
                 )
@@ -345,10 +473,18 @@ async def awg_confirm_connect(callback: CallbackQuery, state: FSMContext) -> Non
                 session.add(awg_inbound)
             await session.commit()
 
+        from aiogram.utils.text_decorations import html_decoration
+
+        origin_note = (
+            "\n\nℹ️ Контейнер официального приложения — переустановка из бота "
+            "запрещена (она стирает чужих пиров)."
+            if is_external else ""
+        )
         await callback.message.edit_text(
             f"✅ <b>AmneziaWG подключён!</b>\n\n"
             f"Порт: <code>{port}/udp</code>\n"
-            f"Контейнер: <code>vpnbot-awg</code>\n\n"
+            f"Контейнер: <code>{html_decoration.quote(container_name)}</code>"
+            f"{origin_note}\n\n"
             "Сервис и inbound добавлены в базу данных.",
             reply_markup=get_back_keyboard(f"server_services_{server_id}"),
             parse_mode="HTML",
@@ -488,12 +624,13 @@ async def _show_awg_obfuscation_choice(message, state: FSMContext, port: int) ->
 
 @router.callback_query(AWGInstall.waiting_for_obfuscation_mode, F.data == "awg_obf_quick")
 async def awg_obf_quick(callback: CallbackQuery, state: FSMContext) -> None:
-    """Quick mode: auto-generate obfuscation and show confirmation."""
+    """Quick mode: auto-generate obfuscation and show container name choice."""
     from app.services.installers.awg_installer import generate_obfuscation_params
 
     obf = generate_obfuscation_params()
     await state.update_data(obfuscation=obf)
-    await _show_awg_confirm(callback.message, state)
+    await _show_awg_container_choice(callback.message, state)
+    await callback.answer()
 
 
 @router.callback_query(AWGInstall.waiting_for_obfuscation_mode, F.data == "awg_obf_advanced")
@@ -537,7 +674,47 @@ async def awg_obf_params_input(message: TgMessage, state: FSMContext) -> None:
     obf = generate_obfuscation_params()
     obf["Jc"] = str(jc)
     await state.update_data(obfuscation=obf)
-    await _show_awg_confirm(message, state)
+    await _show_awg_container_choice(message, state)
+
+
+async def _show_awg_container_choice(message, state: FSMContext) -> None:
+    """Спросить имя контейнера: обычное или распознаваемое офф. клиентом.
+
+    amnezia-awg2 — имя, по которому официальный клиент Amnezia находит
+    AWG-контейнер при добавлении сервера (docker ps-скан): с ним приложение
+    сможет управлять тем же контейнером параллельно с ботом.
+    """
+    await state.set_state(AWGInstall.waiting_for_container_name)
+
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🐳 vpnbot-awg (обычное)", callback_data="awg_name_default")
+    kb.button(text="🤝 amnezia-awg2 (общий с офф. клиентом)", callback_data="awg_name_official")
+    kb.button(text="🔙 Отмена", callback_data="cancel")
+    kb.adjust(1)
+
+    target = message if isinstance(message, TgMessage) else message.message
+    await target.edit_text(
+        "🛡 <b>Выберите имя docker-контейнера</b>\n\n"
+        "🐳 <b>vpnbot-awg</b> — стандартное имя бота\n"
+        "🤝 <b>amnezia-awg2</b> — имя официального клиента Amnezia: приложение "
+        "увидит этот контейнер при добавлении сервера и сможет управлять пирами "
+        "параллельно с ботом (см. docs/amnezia-awg-parallel-management.md)",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(AWGInstall.waiting_for_container_name, F.data.in_({"awg_name_default", "awg_name_official"}))
+async def awg_container_name_chosen(callback: CallbackQuery, state: FSMContext) -> None:
+    """Container name chosen — show final installation confirmation."""
+    container_name = (
+        "vpnbot-awg" if callback.data == "awg_name_default" else "amnezia-awg2"
+    )
+    await state.update_data(container_name=container_name)
+    await _show_awg_confirm(callback.message, state)
+    await callback.answer()
 
 
 async def _show_awg_confirm(message, state: FSMContext) -> None:
@@ -588,6 +765,7 @@ async def awg_execute_install(callback: CallbackQuery, state: FSMContext) -> Non
     obf = data["obfuscation"]
     force = data.get("force_reinstall", False)
     connect_existing = data.get("connect_existing", False)
+    container_name = data.get("container_name", "vpnbot-awg")
 
     await state.clear()
 
@@ -642,6 +820,7 @@ async def awg_execute_install(callback: CallbackQuery, state: FSMContext) -> Non
                     port=port,
                     obfuscation=obf,
                     force=force,
+                    container_name=container_name,
                 )
 
             from app.database.models.inbound import AWGInbound
@@ -659,6 +838,10 @@ async def awg_execute_install(callback: CallbackQuery, state: FSMContext) -> Non
                     existing_awg.obfuscation = install_result["obfuscation"]
                     existing_awg.server_public_key = install_result.get("server_public_key")
                     existing_awg.server_private_key = install_result.get("server_private_key")
+                    existing_awg.container_name = install_result["container_name"]
+                    existing_awg.is_external = False
+                    existing_awg.wipe_detected = False
+                    existing_awg.external_peers_seen = []
                 else:
                     existing_awg.obfuscation = obf
             else:
@@ -670,6 +853,7 @@ async def awg_execute_install(callback: CallbackQuery, state: FSMContext) -> Non
                     obfuscation=install_result["obfuscation"] if install_result else obf,
                     server_public_key=install_result.get("server_public_key") if install_result else None,
                     server_private_key=install_result.get("server_private_key") if install_result else None,
+                    container_name=install_result["container_name"] if install_result else container_name,
                 )
                 session.add(awg_service)
 
@@ -690,7 +874,7 @@ async def awg_execute_install(callback: CallbackQuery, state: FSMContext) -> Non
         await msg.edit_text(
             f"✅ <b>AmneziaWG {action}!</b>\n\n"
             f"Порт: <code>{port}/udp</code>\n"
-            f"Контейнер: <code>vpnbot-awg</code>\n\n"
+            f"Контейнер: <code>{container_name}</code>\n\n"
             "Сервис и inbound добавлены в базу данных.",
             reply_markup=get_back_keyboard(f"server_services_{server_id}"),
             parse_mode="HTML",
@@ -735,6 +919,7 @@ async def awg_force_reinstall(callback: CallbackQuery, state: FSMContext) -> Non
     data = await state.get_data()
     port = data.get("port")
     obf = data.get("obfuscation")
+    container_name = data.get("container_name")
     await state.clear()
 
     if not port:
@@ -768,6 +953,20 @@ async def awg_force_reinstall(callback: CallbackQuery, state: FSMContext) -> Non
             )
             server = result.scalar_one()
 
+            if server.awg_service and server.awg_service.is_external:
+                await msg.edit_text(
+                    "🚫 <b>Переустановка запрещена</b>\n\n"
+                    "Контейнер установлен не ботом (официальное приложение). "
+                    "Переустановка из бота создаст новый контейнер с новыми ключами "
+                    "и уничтожит пиров, добавленных в приложении.",
+                    reply_markup=get_back_keyboard(f"server_services_{server_id}"),
+                    parse_mode="HTML",
+                )
+                return
+
+            if not container_name and server.awg_service:
+                container_name = server.awg_service.container_name
+
             ssh = SSHManager(server, session=session)
             installer = AWGInstaller(
                 ssh,
@@ -781,6 +980,7 @@ async def awg_force_reinstall(callback: CallbackQuery, state: FSMContext) -> Non
                 port=port,
                 obfuscation=obf,
                 force=True,
+                container_name=container_name or "vpnbot-awg",
             )
 
             from app.database.models.inbound import AWGInbound
@@ -797,6 +997,10 @@ async def awg_force_reinstall(callback: CallbackQuery, state: FSMContext) -> Non
                 existing.obfuscation = install_result["obfuscation"]
                 existing.server_public_key = install_result.get("server_public_key")
                 existing.server_private_key = install_result.get("server_private_key")
+                existing.container_name = install_result["container_name"]
+                existing.is_external = False
+                existing.wipe_detected = False
+                existing.external_peers_seen = []
             else:
                 awg_service = AWGService(
                     server_id=server.id,
@@ -806,6 +1010,7 @@ async def awg_force_reinstall(callback: CallbackQuery, state: FSMContext) -> Non
                     obfuscation=install_result["obfuscation"],
                     server_public_key=install_result.get("server_public_key"),
                     server_private_key=install_result.get("server_private_key"),
+                    container_name=install_result["container_name"],
                 )
                 session.add(awg_service)
 
@@ -825,7 +1030,7 @@ async def awg_force_reinstall(callback: CallbackQuery, state: FSMContext) -> Non
         await msg.edit_text(
             "✅ <b>AmneziaWG переустановлен!</b>\n\n"
             f"Порт: <code>{port}/udp</code>\n"
-            f"Контейнер: <code>vpnbot-awg</code>\n\n"
+            f"Контейнер: <code>{install_result['container_name']}</code>\n\n"
             "Сервис обновлён в базе данных.",
             reply_markup=get_back_keyboard(f"server_services_{server_id}"),
             parse_mode="HTML",
@@ -868,6 +1073,17 @@ async def awg_desync_restore_db(callback: CallbackQuery, state: FSMContext) -> N
 
             server = (await session.execute(select(Server).options(selectinload(Server.awg_service)).where(Server.id == server_id))).scalar_one()
 
+            if server.awg_service and server.awg_service.is_external:
+                await msg.edit_text(
+                    "🚫 <b>Восстановление из БД запрещено</b>\n\n"
+                    "Контейнер принадлежит официальному приложению — "
+                    "переустановка уничтожит его пиров. Используйте "
+                    "«Восстановить после wipe» (сохраняет контейнер).",
+                    reply_markup=get_back_keyboard(f"server_services_{server_id}"),
+                    parse_mode="HTML",
+                )
+                return
+
             from app.services.installers.awg_installer import AWGInstaller
             from app.services.ssh_service import SSHManager
 
@@ -880,13 +1096,22 @@ async def awg_desync_restore_db(callback: CallbackQuery, state: FSMContext) -> N
                 return
 
 
-            await installer.install(
+            install_result = await installer.install(
                 port=server.awg_service.port,
                 subnet_ip=server.awg_service.subnet_ip,
                 subnet_cidr=server.awg_service.subnet_cidr,
                 obfuscation=server.awg_service.obfuscation,
-                force=True
+                force=True,
+                container_name=server.awg_service.container_name,
             )
+
+            # Инсталлер генерирует новые серверные ключи — фиксируем их в БД,
+            # иначе wipe-детектор следующего цикла примет это за переустановку.
+            server.awg_service.server_public_key = install_result.get("server_public_key")
+            server.awg_service.server_private_key = install_result.get("server_private_key")
+            server.awg_service.obfuscation = install_result["obfuscation"]
+            server.awg_service.wipe_detected = False
+            server.awg_service.external_peers_seen = []
 
             # Now restore peers
             from app.services.vpn_providers.factory import get_vpn_provider
@@ -905,6 +1130,306 @@ async def awg_desync_restore_db(callback: CallbackQuery, state: FSMContext) -> N
     except Exception as e:
         logger.error("Ошибка восстановления AWG: {}", e, exc_info=True)
         await msg.edit_text(f"❌ Ошибка восстановления:\n<code>{e}</code>", reply_markup=get_back_keyboard(f"server_services_{server_id}"), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("awg_peers_"))
+async def awg_show_peers(callback: CallbackQuery, state: FSMContext) -> None:
+    """Живой список пиров контейнера: свои (из БД) и внешние (от офф. клиента)."""
+    server_id = int(callback.data.split("_")[-1])
+    await callback.answer()
+
+    msg = await callback.message.edit_text("👥 <b>Читаю пиров из контейнера...</b>", parse_mode="HTML")
+
+    try:
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+            from sqlalchemy.orm import selectinload
+
+            from app.database.models import Server
+
+            server = (await session.execute(
+                select(Server)
+                .options(selectinload(Server.awg_service))
+                .where(Server.id == server_id)
+            )).scalar_one()
+
+            if not server.awg_service:
+                await msg.edit_text("❌ Сервис AWG не найден.", reply_markup=get_back_keyboard(f"server_edit_awg_{server_id}"))
+                return
+
+            from app.services.vpn_providers.factory import get_vpn_provider
+
+            provider = get_vpn_provider(server, inbound_type="awg_inbound")
+            try:
+                peers = await provider.list_peers()
+            finally:
+                await provider.close()
+
+            # Свои пиры: AWG-соединения этого сервера + имена подписок.
+            from app.database.models import AWGInboundConnection, Inbound, Subscription
+
+            rows = await session.execute(
+                select(AWGInboundConnection.public_key, Subscription.name)
+                .join(Inbound, AWGInboundConnection.inbound_id == Inbound.id)
+                .outerjoin(Subscription, AWGInboundConnection.subscription_id == Subscription.id)
+                .where(Inbound.server_id == server_id, Inbound.protocol == "awg")
+            )
+            own_map: dict[str, str] = {
+                pub: (name or f"#{pub[:8]}") for pub, name in rows if pub
+            }
+            awg = server.awg_service
+    except Exception as e:
+        logger.error("Ошибка чтения пиров AWG: {}", e, exc_info=True)
+        await msg.edit_text(
+            f"❌ <b>Не удалось прочитать пиров</b>\n\n<code>{e}</code>",
+            reply_markup=get_back_keyboard(f"server_edit_awg_{server_id}"),
+            parse_mode="HTML",
+        )
+        return
+
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from aiogram.utils.text_decorations import html_decoration
+
+    if not peers:
+        await msg.edit_text(
+            "👥 <b>Пиры контейнера</b>\n\nВ живом конфиге нет ни одного пира.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data=f"server_edit_awg_{server_id}")],
+            ]),
+            parse_mode="HTML",
+        )
+        return
+
+    own_count = sum(1 for p in peers if p["public_key"] in own_map)
+    ext_peers = [p for p in peers if p["public_key"] not in own_map]
+
+    def _fmt_traffic(peer: dict) -> str:
+        rx = peer.get("rx", 0) or 0
+        tx = peer.get("tx", 0) or 0
+        hs = peer.get("last_handshake", 0) or 0
+        traffic = f"↓{rx / 1024 / 1024:.1f}МБ ↑{tx / 1024 / 1024:.1f}МБ"
+        hand = "🟢" if hs and hs > 0 else "⚪️"
+        return f"{hand} {traffic}"
+
+    lines = [f"👥 <b>Пиры контейнера</b> <code>{html_decoration.quote(awg.container_name)}</code>\n"]
+    lines.append(f"<b>Свои (бот):</b> {own_count}, <b>внешние: {len(ext_peers)}</b>\n")
+
+    shown = peers[:20]
+    external_rows = []
+    for peer in shown:
+        pub = peer["public_key"]
+        ip = peer.get("client_ip") or "—"
+        if pub in own_map:
+            lines.append(f"🔵 {html_decoration.quote(str(own_map[pub]))} — <code>{ip}</code> ({_fmt_traffic(peer)})")
+        else:
+            name = peer.get("name") or "без имени"
+            lines.append(f"🔘 {html_decoration.quote(name)} — <code>{ip}</code> ({_fmt_traffic(peer)}) [внешний]")
+            external_rows.append(peer)
+    if len(peers) > 20:
+        lines.append(f"…и ещё {len(peers) - 20}")
+
+    # Список внешних пиров кладём в FSM — кнопки ссылаются по индексу.
+    await state.update_data(awg_external_peers=external_rows, awg_server_id=server_id)
+
+    keyboard = []
+    for idx, peer in enumerate(external_rows[:10]):
+        name = peer.get("name") or peer.get("client_ip") or "?"
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"🗑 Удалить: {name[:24]}",
+                callback_data=f"awg_ext_rm_{idx}",
+            ),
+            InlineKeyboardButton(text="✏️", callback_data=f"awg_ext_rn_{idx}"),
+        ])
+    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"awg_peers_{server_id}")])
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"server_edit_awg_{server_id}")])
+
+    await msg.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("awg_ext_rm_"))
+async def awg_external_remove(callback: CallbackQuery, state: FSMContext) -> None:
+    """Удалить внешний пир (конфиг + ядро + clientsTable)."""
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    peers = data.get("awg_external_peers") or []
+    server_id = data.get("awg_server_id")
+
+    if server_id is None or idx >= len(peers):
+        await callback.answer("Список устарел — обновите", show_alert=True)
+        return
+
+    peer = peers[idx]
+    name = peer.get("name") or peer.get("client_ip") or peer["public_key"][:8]
+    await callback.answer()
+
+    msg = await callback.message.edit_text(
+        f"🗑 Удаляю внешний пир <b>{name}</b>...", parse_mode="HTML"
+    )
+
+    try:
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+            from sqlalchemy.orm import selectinload
+
+            from app.database.models import Server
+
+            server = (await session.execute(
+                select(Server)
+                .options(selectinload(Server.awg_service))
+                .where(Server.id == server_id)
+            )).scalar_one()
+
+            from app.services.vpn_providers.factory import get_vpn_provider
+
+            provider = get_vpn_provider(server, inbound_type="awg_inbound")
+            try:
+                ok = await provider.remove_external_peer(peer)
+            finally:
+                await provider.close()
+    except Exception as e:
+        logger.error("Ошибка удаления внешнего пира: {}", e, exc_info=True)
+        await msg.edit_text(
+            f"❌ <b>Ошибка удаления</b>\n\n<code>{e}</code>",
+            reply_markup=get_back_keyboard(f"awg_peers_{server_id}"),
+            parse_mode="HTML",
+        )
+        return
+
+    if ok:
+        await msg.edit_text(
+            f"✅ Внешний пир <b>{name}</b> удалён.",
+            reply_markup=get_back_keyboard(f"awg_peers_{server_id}"),
+            parse_mode="HTML",
+        )
+    else:
+        await msg.edit_text(
+            f"❌ Не удалось удалить пира <b>{name}</b> (подробности в логах).",
+            reply_markup=get_back_keyboard(f"awg_peers_{server_id}"),
+            parse_mode="HTML",
+        )
+
+
+@router.callback_query(F.data.startswith("awg_ext_rn_"))
+async def awg_external_rename(callback: CallbackQuery, state: FSMContext) -> None:
+    """Переименовать внешний пир в clientsTable (имя в UI офф. приложения)."""
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    peers = data.get("awg_external_peers") or []
+
+    if idx >= len(peers):
+        await callback.answer("Список устарел — обновите", show_alert=True)
+        return
+
+    await state.update_data(awg_rename_idx=idx)
+    await state.set_state(AWGPeers.waiting_for_rename)
+    await callback.message.edit_text(
+        "✏️ Введите новое имя для пира "
+        f"<code>{peers[idx].get('client_ip') or peers[idx]['public_key'][:12]}</code>:",
+        reply_markup=get_back_keyboard(f"awg_peers_{data.get('awg_server_id')}"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AWGPeers.waiting_for_rename)
+async def awg_external_rename_input(message: TgMessage, state: FSMContext) -> None:
+    """Apply new name to clientsTable entry."""
+    data = await state.get_data()
+    idx = data.get("awg_rename_idx")
+    peers = data.get("awg_external_peers") or []
+    server_id = data.get("awg_server_id")
+
+    name = (message.text or "").strip()
+    if not name or len(name) > 64:
+        await message.answer("❌ Имя: 1-64 символа. Попробуйте снова.")
+        return
+    if idx is None or server_id is None or idx >= len(peers):
+        await state.clear()
+        await message.answer("❌ Список устарел. Откройте «Пиры контейнера» заново.")
+        return
+
+    peer = peers[idx]
+    try:
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+            from sqlalchemy.orm import selectinload
+
+            from app.database.models import Server
+
+            server = (await session.execute(
+                select(Server)
+                .options(selectinload(Server.awg_service))
+                .where(Server.id == server_id)
+            )).scalar_one()
+
+            from app.services.vpn_providers.factory import get_vpn_provider
+
+            provider = get_vpn_provider(server, inbound_type="awg_inbound")
+            try:
+                await provider.upsert_clients_table_entry(peer["public_key"], name)
+            finally:
+                await provider.close()
+    except Exception as e:
+        logger.error("Ошибка переименования пира: {}", e, exc_info=True)
+        await message.answer(f"❌ Ошибка переименования: <code>{e}</code>", parse_mode="HTML")
+        await state.set_state(None)
+        return
+
+    await state.set_state(None)
+    await message.answer(
+        f"✅ Пир переименован в «{name}».",
+        reply_markup=get_back_keyboard(f"awg_peers_{server_id}"),
+    )
+
+
+@router.callback_query(F.data.startswith("awg_wipe_recover_"))
+async def awg_wipe_recover(callback: CallbackQuery, state: FSMContext) -> None:
+    """Восстановление после wipe: перечитать ключи контейнера и вернуть пиров из БД."""
+    server_id = int(callback.data.split("_")[-1])
+    await callback.answer()
+
+    msg = await callback.message.edit_text(
+        "🔧 <b>Восстановление после wipe...</b>\n\n"
+        "Перечитываю серверные ключи и возвращаю пиров из БД.",
+        parse_mode="HTML",
+    )
+
+    try:
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+            from sqlalchemy.orm import selectinload
+
+            from app.database.models import Server
+
+            server = (await session.execute(
+                select(Server)
+                .options(selectinload(Server.awg_service))
+                .where(Server.id == server_id)
+            )).scalar_one()
+
+            from app.services.protocol_sync.awg_sync import recover_after_wipe
+
+            result = await recover_after_wipe(session, server)
+            await session.commit()
+    except Exception as e:
+        logger.error("Ошибка восстановления после wipe: {}", e, exc_info=True)
+        await msg.edit_text(
+            f"❌ <b>Ошибка восстановления</b>\n\n<code>{e}</code>",
+            reply_markup=get_back_keyboard(f"server_edit_awg_{server_id}"),
+            parse_mode="HTML",
+        )
+        return
+
+    await msg.edit_text(
+        f"✅ <b>Восстановление завершено</b>\n\n{result}",
+        reply_markup=get_back_keyboard(f"server_edit_awg_{server_id}"),
+        parse_mode="HTML",
+    )
 
 
 async def _awg_ask_port(message_or_callback, state: FSMContext) -> None:
